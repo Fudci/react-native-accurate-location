@@ -14,23 +14,28 @@
 @property (nonatomic, strong, nullable) CLLocation *bestLocation;
 @property (nonatomic, assign) double currentDesiredAccuracy;
 @property (nonatomic, assign) double currentAcceptableAccuracy;
-// Stabilisasi: sample <= acceptable sebelumnya + hitungan beruntun konsisten.
+// Stabilization: previous sample <= acceptable + count of consecutive consistent samples.
 @property (nonatomic, strong, nullable) CLLocation *lastAcceptable;
 @property (nonatomic, assign) NSInteger stableCount;
-// Plateau: token untuk membatalkan timer plateau lama saat akurasi masih membaik.
+// Plateau: token to cancel a stale plateau timer while accuracy is still improving.
 @property (nonatomic, assign) NSInteger plateauToken;
 @property (nonatomic, assign) BOOL plateauArmed;
+// notDetermined: defer starting updates until the user answers the permission prompt.
+@property (nonatomic, assign) BOOL awaitingAuthToFetch;
+@property (nonatomic, assign) double pendingTimeoutMs;
+// requestPermission(): promise waiting for the authorization result.
+@property (nonatomic, copy, nullable) RCTPromiseResolveBlock permissionResolve;
 @end
 
-// Stabilisasi: butuh N sample beruntun yang konsisten (jarak antar-sample kecil).
+// Stabilization: require N consecutive consistent samples (small inter-sample distance).
 static const NSInteger kRequiredStableSamples = 2;
 static const CLLocationDistance kMaxJumpMeters = 5.0;
-// Plateau: kalau akurasi tak membaik >kImproveEps selama kPlateauMs -> resolve terbaik.
+// Plateau: if accuracy does not improve by >kImproveEps within kPlateauMs -> resolve best.
 static const double kPlateauMs = 2000.0;
 static const CLLocationAccuracy kImproveEps = 1.0;
-// Cache instan hanya bila SANGAT baru (< 1 detik) dan sudah akurat.
+// Instant cache only if VERY fresh (< 1 second) and already accurate.
 static const NSTimeInterval kInstantCacheMaxAge = 1.0;
-// Sample lebih tua dari ini diabaikan, supaya offline tidak mengembalikan posisi lama.
+// Samples older than this are ignored, so offline does not return a stale position.
 static const NSTimeInterval kMaxSampleAge = 10.0;
 
 @implementation AccurateLocation
@@ -93,8 +98,19 @@ RCT_EXPORT_MODULE(AccurateLocation)
         return;
     }
 
-    // Fail-fast bila location services (GPS) mati. Panggil di background queue
-    // untuk menghindari peringatan "may cause UI unresponsiveness".
+    self.currentDesiredAccuracy = desiredAccuracyMeters;
+    self.pendingTimeoutMs = timeoutMs;
+
+    // notDetermined: request permission first, continue in didChangeAuthorization. Without
+    // this, startUpdatingLocation shows no prompt and the request hangs until timeout.
+    if (status == kCLAuthorizationStatusNotDetermined) {
+        self.awaitingAuthToFetch = YES;
+        [self.locationManager requestWhenInUseAuthorization];
+        return;
+    }
+
+    // Fail-fast if location services (GPS) are off. Call on a background queue
+    // to avoid the "may cause UI unresponsiveness" warning.
     __block BOOL servicesEnabled = YES;
     dispatch_sync(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
         servicesEnabled = [CLLocationManager locationServicesEnabled];
@@ -109,16 +125,21 @@ RCT_EXPORT_MODULE(AccurateLocation)
     CLLocation *lastLoc = self.locationManager.location;
     if (lastLoc) {
         NSTimeInterval age = -[lastLoc.timestamp timeIntervalSinceNow];
-        // Cache instan hanya bila sangat baru & sudah memenuhi target ideal,
-        // supaya cache kasar/lama tidak mengorbankan akurasi.
+        // Instant cache only if very fresh & already meets the ideal target,
+        // so a coarse/stale cache never compromises accuracy.
         if (age < kInstantCacheMaxAge && lastLoc.horizontalAccuracy > 0 && lastLoc.horizontalAccuracy <= desiredAccuracyMeters) {
             [self finishWithLocation:lastLoc];
             return;
         }
     }
 
-    // Set timeout to return best available if target not reached
-    self.currentDesiredAccuracy = desiredAccuracyMeters;
+    [self beginLocationUpdates];
+}
+
+// Arm the timeout + start continuous updates. Extracted so it can be re-invoked from
+// didChangeAuthorization after the user answers the permission prompt (notDetermined case).
+- (void)beginLocationUpdates {
+    double timeoutMs = self.pendingTimeoutMs;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeoutMs * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
         if (self.isFetching) {
             if (self.bestLocation && self.bestLocation.horizontalAccuracy > 0) {
@@ -139,10 +160,19 @@ RCT_EXPORT_MODULE(AccurateLocation)
 RCT_EXPORT_METHOD(getCurrentLocation:(NSDictionary *)options
                   resolve:(RCTPromiseResolveBlock)resolve
                   reject:(RCTPromiseRejectBlock)reject) {
-    double desiredAccuracyMeters = options[@"desiredAccuracyMeters"] ? [options[@"desiredAccuracyMeters"] doubleValue] : 7.0;
-    double acceptableAccuracyMeters = options[@"acceptableAccuracyMeters"] ? [options[@"acceptableAccuracyMeters"] doubleValue] : desiredAccuracyMeters;
-    double timeoutMs = options[@"timeoutMs"] ? [options[@"timeoutMs"] doubleValue] : 10000.0;
+    double desiredAccuracyMeters = options[@"desiredAccuracyMeters"] ? [options[@"desiredAccuracyMeters"] doubleValue] : 8.0;
+    double acceptableAccuracyMeters = options[@"acceptableAccuracyMeters"] ? [options[@"acceptableAccuracyMeters"] doubleValue] : 15.0;
+    double timeoutMs = options[@"timeoutMs"] ? [options[@"timeoutMs"] doubleValue] : 15000.0;
     [self fetchLocationWithAccuracy:desiredAccuracyMeters acceptable:acceptableAccuracyMeters timeout:timeoutMs resolve:resolve reject:reject];
+}
+
+RCT_EXPORT_METHOD(cancel) {
+    [self doCancel];
+}
+
+RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject) {
+    [self doRequestPermission:resolve reject:reject];
 }
 #endif
 
@@ -154,8 +184,8 @@ RCT_EXPORT_METHOD(getCurrentLocation:(NSDictionary *)options
 
     if (location.horizontalAccuracy <= 0) return;
 
-    // Buang sample basi: CoreLocation bisa mengirim fix cache lama sebagai update
-    // pertama. Saat OFFLINE ini yang bikin posisi "nyangkut" di lokasi lama.
+    // Drop stale samples: CoreLocation may deliver an old cached fix as the first
+    // update. When OFFLINE this is what makes the position "stick" at an old location.
     NSTimeInterval sampleAge = -[location.timestamp timeIntervalSinceNow];
     if (sampleAge > kMaxSampleAge) return;
 
@@ -167,7 +197,7 @@ RCT_EXPORT_METHOD(getCurrentLocation:(NSDictionary *)options
     CLLocation *best = self.bestLocation;
     if (!best) return;
 
-    // Konvergensi (anti-lompat): hitung sample beruntun yang dekat satu sama lain.
+    // Convergence (anti-jump): count consecutive samples close to each other.
     if (location.horizontalAccuracy <= self.currentAcceptableAccuracy) {
         CLLocation *prev = self.lastAcceptable;
         if (prev && [prev distanceFromLocation:location] <= kMaxJumpMeters) {
@@ -178,17 +208,17 @@ RCT_EXPORT_METHOD(getCurrentLocation:(NSDictionary *)options
         self.lastAcceptable = location;
     }
 
-    // Belum settle -> jangan resolve dulu (hindari titik jitter).
+    // Not settled yet -> do not resolve (avoid jittery points).
     if (self.stableCount < kRequiredStableSamples) return;
 
-    // Sudah mencapai target ideal -> selesai (pakai lokasi terbaik).
+    // Ideal target reached -> finish (use the best location).
     if (best.horizontalAccuracy <= self.currentDesiredAccuracy) {
         [self finishWithLocation:best];
         return;
     }
 
-    // Sudah settle & cukup baik: kejar akurasi lebih rapat, tapi kalau tidak membaik
-    // selama kPlateauMs -> resolve lokasi TERBAIK (bukan yang terakhir).
+    // Settled & good enough: keep chasing tighter accuracy, but if it does not improve
+    // within kPlateauMs -> resolve the BEST location (not the latest).
     if (best.horizontalAccuracy <= self.currentAcceptableAccuracy) {
         if (!self.plateauArmed || improved) {
             self.plateauArmed = YES;
@@ -208,6 +238,48 @@ RCT_EXPORT_METHOD(getCurrentLocation:(NSDictionary *)options
     // kCLErrorLocationUnknown is transient, keep waiting
     if (error.code == kCLErrorLocationUnknown) return;
     [self finishWithError:@"LOCATION_ERROR" message:error.localizedDescription];
+}
+
+// iOS 14+
+- (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager {
+    CLAuthorizationStatus status;
+    if (@available(iOS 14.0, *)) {
+        status = manager.authorizationStatus;
+    } else {
+        status = [CLLocationManager authorizationStatus];
+    }
+    [self handleAuthorizationStatus:status];
+}
+
+// iOS < 14
+- (void)locationManager:(CLLocationManager *)manager
+    didChangeAuthorizationStatus:(CLAuthorizationStatus)status {
+    [self handleAuthorizationStatus:status];
+}
+
+- (void)handleAuthorizationStatus:(CLAuthorizationStatus)status {
+    // notDetermined is still waiting for the user's answer; ignore this early callback.
+    if (status == kCLAuthorizationStatusNotDetermined) return;
+
+    BOOL authorized = (status == kCLAuthorizationStatusAuthorizedWhenInUse ||
+                       status == kCLAuthorizationStatusAuthorizedAlways);
+
+    // 1) Resolve a pending requestPermission().
+    if (self.permissionResolve) {
+        RCTPromiseResolveBlock resolve = self.permissionResolve;
+        self.permissionResolve = nil;
+        resolve(authorized ? @"granted" : @"blocked");
+    }
+
+    // 2) Continue a getCurrentLocation() that was waiting for permission (notDetermined case).
+    if (self.awaitingAuthToFetch) {
+        self.awaitingAuthToFetch = NO;
+        if (authorized) {
+            [self beginLocationUpdates];
+        } else {
+            [self finishWithError:@"LOCATION_PERMISSION_DENIED" message:@"Location permission denied"];
+        }
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -245,6 +317,7 @@ RCT_EXPORT_METHOD(getCurrentLocation:(NSDictionary *)options
 - (void)finishWithError:(NSString *)code message:(NSString *)message {
     if (!self.isFetching) return;
     self.isFetching = NO;
+    self.awaitingAuthToFetch = NO;
     [self.locationManager stopUpdatingLocation];
     self.bestLocation = nil;
 
@@ -255,16 +328,59 @@ RCT_EXPORT_METHOD(getCurrentLocation:(NSDictionary *)options
     }
 }
 
+// ─── cancel / requestPermission (shared core) ────────────────────────────────
+
+- (void)doCancel {
+    if (self.isFetching) {
+        [self finishWithError:@"LOCATION_CANCELLED" message:@"Location request was cancelled"];
+    }
+}
+
+- (void)doRequestPermission:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
+    CLAuthorizationStatus status;
+    if (@available(iOS 14.0, *)) {
+        status = self.locationManager.authorizationStatus;
+    } else {
+        status = [CLLocationManager authorizationStatus];
+    }
+
+    switch (status) {
+        case kCLAuthorizationStatusAuthorizedWhenInUse:
+        case kCLAuthorizationStatusAuthorizedAlways:
+            resolve(@"granted");
+            return;
+        case kCLAuthorizationStatusDenied:
+        case kCLAuthorizationStatusRestricted:
+            resolve(@"blocked");
+            return;
+        case kCLAuthorizationStatusNotDetermined:
+        default:
+            // Resolved in handleAuthorizationStatus after the user answers the prompt.
+            self.permissionResolve = resolve;
+            [self.locationManager requestWhenInUseAuthorization];
+            return;
+    }
+}
+
 // ─── New Architecture TurboModule ────────────────────────────────────────────
 
 #ifdef RCT_NEW_ARCH_ENABLED
 - (void)getCurrentLocation:(JS::NativeAccurateLocation::AccurateLocationOptions &)options
                    resolve:(RCTPromiseResolveBlock)resolve
                     reject:(RCTPromiseRejectBlock)reject {
-    double desiredAccuracyMeters = options.desiredAccuracyMeters().has_value() ? options.desiredAccuracyMeters().value() : 7.0;
-    double acceptableAccuracyMeters = options.acceptableAccuracyMeters().has_value() ? options.acceptableAccuracyMeters().value() : desiredAccuracyMeters;
-    double timeoutMs = options.timeoutMs().has_value() ? options.timeoutMs().value() : 10000.0;
+    double desiredAccuracyMeters = options.desiredAccuracyMeters().has_value() ? options.desiredAccuracyMeters().value() : 8.0;
+    double acceptableAccuracyMeters = options.acceptableAccuracyMeters().has_value() ? options.acceptableAccuracyMeters().value() : 15.0;
+    double timeoutMs = options.timeoutMs().has_value() ? options.timeoutMs().value() : 15000.0;
     [self fetchLocationWithAccuracy:desiredAccuracyMeters acceptable:acceptableAccuracyMeters timeout:timeoutMs resolve:resolve reject:reject];
+}
+
+- (void)cancel {
+    [self doCancel];
+}
+
+- (void)requestPermission:(RCTPromiseResolveBlock)resolve
+                   reject:(RCTPromiseRejectBlock)reject {
+    [self doRequestPermission:resolve reject:reject];
 }
 
 - (std::shared_ptr<facebook::react::TurboModule>)getTurboModule:

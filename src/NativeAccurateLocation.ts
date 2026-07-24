@@ -19,10 +19,16 @@ export type AccurateLocationResult = {
   isMocked: boolean;
 };
 
+export type PermissionStatus = 'granted' | 'denied' | 'blocked' | 'unavailable';
+
 export interface Spec extends TurboModule {
   getCurrentLocation(
     options?: AccurateLocationOptions,
   ): Promise<AccurateLocationResult>;
+  /** Cancel the in-flight location request. Safe to call when no request is active. */
+  cancel(): void;
+  /** Request location permission from the system. Resolves with the final status. */
+  requestPermission(): Promise<PermissionStatus>;
 }
 
 const nativeModule = TurboModuleRegistry.get<Spec>('AccurateLocation');
@@ -30,11 +36,13 @@ const nativeModule = TurboModuleRegistry.get<Spec>('AccurateLocation');
 const fallback = {
   getCurrentLocation: async () => {
     throw new Error(
-      `[AccurateLocation] Native module tidak tersedia di platform ${Platform.OS}. Pastikan sudah rebuild native.`,
+      `[AccurateLocation] Native module is not available on platform ${Platform.OS}. Make sure you have rebuilt the native app.`,
     );
   },
-  addListener: () => { },
-  removeListeners: () => { },
+  cancel: () => {},
+  requestPermission: async (): Promise<PermissionStatus> => 'unavailable',
+  addListener: () => {},
+  removeListeners: () => {},
 } as unknown as Spec;
 
 export default (nativeModule ?? fallback) as Spec;

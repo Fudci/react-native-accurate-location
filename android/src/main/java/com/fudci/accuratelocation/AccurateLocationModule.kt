@@ -15,6 +15,8 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.module.annotations.ReactModule
+import com.facebook.react.modules.core.PermissionAwareActivity
+import com.facebook.react.modules.core.PermissionListener
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
@@ -30,23 +32,26 @@ class AccurateLocationModule(
     companion object {
         const val NAME = "AccurateLocation"
         private const val DEFAULT_DESIRED_ACCURACY_METERS = 8.0
+        private const val DEFAULT_ACCEPTABLE_ACCURACY_METERS = 15.0
         private const val DEFAULT_TIMEOUT_MS = 15000.0
+        private const val PERMISSION_REQUEST_CODE = 4269
 
-        // Stabilisasi: jumlah sample beruntun yang harus konsisten sebelum resolve dini,
-        // dan batas lompatan antar-sample (meter) yang masih dianggap "settle" (bukan jitter).
+        // Stabilization: number of consecutive samples that must be consistent before
+        // resolving early, and the max jump (meters) between samples still considered
+        // "settled" (i.e. not jitter).
         private const val REQUIRED_STABLE_SAMPLES = 2
         private const val MAX_JUMP_METERS = 5.0f
 
-        // Plateau: kalau akurasi terbaik tidak membaik lebih dari IMPROVE_EPS_METERS
-        // selama PLATEAU_MS, anggap sudah mentok -> resolve pakai lokasi terbaik.
+        // Plateau: if the best accuracy does not improve by more than IMPROVE_EPS_METERS
+        // within PLATEAU_MS, assume it has bottomed out -> resolve with the best location.
         private const val PLATEAU_MS = 2000L
         private const val IMPROVE_EPS_METERS = 1.0f
 
-        // Cache instan: hanya boleh dipakai bila SANGAT baru (< 1 detik) dan sudah akurat.
+        // Instant cache: only usable when VERY fresh (< 1 second) and already accurate.
         private const val INSTANT_CACHE_MAX_AGE_MS = 1000L
 
-        // Batas umur cache untuk boleh dijadikan "bestLocation" awal (fallback timeout).
-        // Lebih tua dari ini -> cache diabaikan supaya offline tidak mengembalikan posisi lama.
+        // Max cache age allowed to seed the initial "bestLocation" (timeout fallback).
+        // Older than this -> cache is ignored so offline does not return a stale position.
         private const val SEED_CACHE_MAX_AGE_MS = 10000L
     }
 
@@ -57,6 +62,12 @@ class AccurateLocationModule(
 
     private val fusedLocationClient: FusedLocationProviderClient =
         LocationServices.getFusedLocationProviderClient(reactApplicationContext)
+
+    // Handle to cancel the active location request from outside (invoked by cancel()).
+    private var activeCancel: (() -> Unit)? = null
+
+    // Permission promise waiting for the requestPermissions result.
+    private var pendingPermissionPromise: Promise? = null
 
     override fun getName(): String = NAME
 
@@ -72,7 +83,7 @@ class AccurateLocationModule(
             return
         }
 
-        // Fail-fast bila location services (GPS) mati — jangan tunggu timeout penuh.
+        // Fail-fast if location services (GPS) are off — do not wait for the full timeout.
         if (!isLocationEnabled()) {
             promise.reject(
                 "LOCATION_SERVICES_DISABLED",
@@ -86,11 +97,11 @@ class AccurateLocationModule(
                 ?.getDouble("desiredAccuracyMeters")
                 ?: DEFAULT_DESIRED_ACCURACY_METERS
 
-        // Batas "cukup baik". Default = target ideal (backward-compatible).
+        // "Good enough" threshold. Default is looser than the ideal target for faster resolve.
         val acceptableAccuracyMeters =
             options?.takeIf { it.hasKey("acceptableAccuracyMeters") }
                 ?.getDouble("acceptableAccuracyMeters")
-                ?: desiredAccuracyMeters
+                ?: DEFAULT_ACCEPTABLE_ACCURACY_METERS
 
         val timeoutMs =
             options?.takeIf { it.hasKey("timeoutMs") }
@@ -102,6 +113,46 @@ class AccurateLocationModule(
             acceptableAccuracyMeters = acceptableAccuracyMeters.toFloat(),
             timeoutMs = timeoutMs.toLong(),
             promise = promise
+        )
+    }
+
+    override fun cancel() {
+        activeCancel?.invoke()
+    }
+
+    override fun requestPermission(promise: Promise) {
+        if (hasFineLocationPermission()) {
+            promise.resolve("granted")
+            return
+        }
+
+        val activity = currentActivity
+        if (activity == null || activity !is PermissionAwareActivity) {
+            promise.resolve("unavailable")
+            return
+        }
+
+        // Only one permission request at a time.
+        pendingPermissionPromise?.let {
+            it.resolve("denied")
+        }
+        pendingPermissionPromise = promise
+
+        val listener = PermissionListener { requestCode, _, grantResults ->
+            if (requestCode != PERMISSION_REQUEST_CODE) return@PermissionListener false
+            val p = pendingPermissionPromise
+            pendingPermissionPromise = null
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            // Pure native cannot distinguish "denied" from "blocked/don't ask again".
+            p?.resolve(if (granted) "granted" else "denied")
+            true
+        }
+
+        activity.requestPermissions(
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
+            PERMISSION_REQUEST_CODE,
+            listener
         )
     }
 
@@ -137,7 +188,7 @@ class AccurateLocationModule(
         var callback: LocationCallback? = null
         var gpsListener: LocationListener? = null
 
-        // Stabilisasi: sample <= acceptable sebelumnya + hitung berapa kali beruntun konsisten.
+        // Stabilization: previous sample <= acceptable + count of consecutive consistent samples.
         var lastAcceptable: Location? = null
         var stableCount = 0
         var plateauRunnable: Runnable? = null
@@ -145,6 +196,7 @@ class AccurateLocationModule(
         fun finish(location: Location?, code: String? = null, message: String? = null) {
             if (didFinish) return
             didFinish = true
+            activeCancel = null
             callback?.let { fusedLocationClient.removeLocationUpdates(it) }
             gpsListener?.let { locationManager?.removeUpdates(it) }
             timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
@@ -168,8 +220,13 @@ class AccurateLocationModule(
             )
         }
 
-        // Proses satu sample lokasi (dari fused maupun GPS hardware) dengan aturan
-        // stabilisasi + plateau yang sama, lalu resolve bila sudah memenuhi syarat.
+        // Register the cancellation handle; invoked by cancel() from JS.
+        activeCancel = {
+            finish(null, "LOCATION_CANCELLED", "Location request was cancelled")
+        }
+
+        // Process a single location sample (from either fused or hardware GPS) with the
+        // same stabilization + plateau rules, then resolve once the criteria are met.
         fun processSample(latestLocation: Location) {
             if (didFinish) return
             if (!latestLocation.hasAccuracy()) return
@@ -182,7 +239,7 @@ class AccurateLocationModule(
             }
             val best = bestLocation ?: return
 
-            // Konvergensi (anti-lompat): hitung sample beruntun yang dekat satu sama lain.
+            // Convergence (anti-jump): count consecutive samples close to each other.
             if (latestLocation.accuracy <= acceptableAccuracyMeters) {
                 val prev = lastAcceptable
                 stableCount = if (prev != null && prev.distanceTo(latestLocation) <= MAX_JUMP_METERS) {
@@ -193,17 +250,17 @@ class AccurateLocationModule(
                 lastAcceptable = latestLocation
             }
 
-            // Belum settle -> jangan resolve dulu (hindari titik jitter).
+            // Not settled yet -> do not resolve (avoid jittery points).
             if (stableCount < REQUIRED_STABLE_SAMPLES) return
 
-            // Sudah mencapai target ideal -> langsung selesai (pakai lokasi terbaik).
+            // Ideal target reached -> finish immediately (use the best location).
             if (best.accuracy <= desiredAccuracyMeters) {
                 finish(best)
                 return
             }
 
-            // Sudah settle & cukup baik: kejar akurasi lebih rapat, tapi kalau tidak
-            // membaik lagi selama PLATEAU_MS -> resolve lokasi TERBAIK (bukan yang terakhir).
+            // Settled & good enough: keep chasing tighter accuracy, but if it does not
+            // improve within PLATEAU_MS -> resolve the BEST location (not the latest).
             if (best.accuracy <= acceptableAccuracyMeters) {
                 if (plateauRunnable == null || improved) {
                     plateauRunnable?.let { mainHandler.removeCallbacks(it) }
@@ -219,7 +276,7 @@ class AccurateLocationModule(
 
             val locationRequest = LocationRequest.Builder(
                 Priority.PRIORITY_HIGH_ACCURACY,
-                500L // Polling sangat cepat (setiap 0.5 detik)
+                500L // Very fast polling (every 0.5s)
             )
                 .setMinUpdateIntervalMillis(250L)
                 .setWaitForAccurateLocation(true)
@@ -240,8 +297,8 @@ class AccurateLocationModule(
                 callback!!,
                 Looper.getMainLooper()
             ).addOnFailureListener { error ->
-                // Fused gagal (mis. Play Services bermasalah). Jangan langsung menyerah:
-                // GPS hardware bisa jalan sendiri. Reject hanya bila keduanya tak tersedia.
+                // Fused failed (e.g. Play Services issue). Don't give up immediately:
+                // hardware GPS can still run on its own. Reject only if both are unavailable.
                 if (gpsListener == null) {
                     finish(
                         bestLocation,
@@ -251,8 +308,8 @@ class AccurateLocationModule(
                 }
             }
 
-            // Fallback GPS hardware (satelit murni, tidak butuh internet). Berjalan paralel
-            // dengan fused supaya saat OFFLINE tetap dapat fix terbaru, bukan cache lama.
+            // Hardware GPS fallback (pure satellite, no internet needed). Runs in parallel
+            // with fused so that OFFLINE still yields the latest fix, not a stale cache.
             val lm = locationManager
             if (lm != null && lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
                 val listener = object : LocationListener {
@@ -280,15 +337,15 @@ class AccurateLocationModule(
             }
         }
 
-        // Cek lokasi terakhir dulu
+        // Check the last known location first
         fusedLocationClient.lastLocation.addOnCompleteListener { task ->
             if (didFinish) return@addOnCompleteListener
             if (task.isSuccessful) {
                 val location = task.result
                 if (location != null) {
                     val ageMs = System.currentTimeMillis() - location.time
-                    // Cache instan hanya bila SANGAT baru (< 1 detik) dan sudah memenuhi
-                    // target ideal, supaya cache yang kasar/lama tidak mengorbankan akurasi.
+                    // Instant cache only if VERY fresh (< 1s) and already meets the ideal
+                    // target, so a coarse/stale cache never compromises accuracy.
                     if (ageMs < INSTANT_CACHE_MAX_AGE_MS &&
                         location.hasAccuracy() &&
                         location.accuracy <= desiredAccuracyMeters
@@ -296,15 +353,15 @@ class AccurateLocationModule(
                         finish(location)
                         return@addOnCompleteListener
                     }
-                    // Jadikan seed "bestLocation" HANYA bila cache masih cukup baru.
-                    // Cache lama diabaikan agar saat offline timeout tidak mengembalikan
-                    // posisi lama — biarkan fix satelit terbaru yang mengisi bestLocation.
+                    // Seed "bestLocation" ONLY when the cache is still fresh enough.
+                    // A stale cache is ignored so an offline timeout does not return an
+                    // old position — let the latest satellite fix fill bestLocation.
                     if (ageMs < SEED_CACHE_MAX_AGE_MS) {
                         bestLocation = location
                     }
                 }
             }
-            // Jika tidak ada lokasi atau kurang akurat, paksa recalculate ulang!
+            // If there is no location or it is not accurate enough, force a fresh recalculation.
             startLocationUpdates()
         }
     }

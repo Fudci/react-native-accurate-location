@@ -51,7 +51,7 @@
     "url": "https://github.com/fudci/react-native-accurate-location/issues"
   },
   "homepage": "https://github.com/fudci/react-native-accurate-location#readme",
-  "author": "myworkspace <dev@myworkspace.com>",
+  "author": "fudci <as.andisusilo@gmail.com>",
   "license": "MIT",
   "codegenConfig": {
     "name": "AccurateLocationSpec",

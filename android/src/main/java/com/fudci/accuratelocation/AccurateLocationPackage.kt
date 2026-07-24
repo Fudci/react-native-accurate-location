@@ -1,4 +1,4 @@
-package com.myworkspace.accuratelocation
+package com.fudci.accuratelocation
 
 import com.facebook.react.ReactPackage
 import com.facebook.react.bridge.NativeModule

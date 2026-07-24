@@ -4,7 +4,7 @@ apply plugin: 'com.facebook.react'
 
 android {
   compileSdk 35
-  namespace "com.myworkspace.accuratelocation"
+  namespace "com.fudci.accuratelocation"
   defaultConfig { minSdk 24 }
 }
 

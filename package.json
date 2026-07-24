@@ -58,7 +58,7 @@
     "type": "modules",
     "jsSrcsDir": "src",
     "android": {
-      "javaPackageName": "com.myworkspace.accuratelocation"
+      "javaPackageName": "com.fudci.accuratelocation"
     }
   },
   "peerDependencies": {

@@ -5,9 +5,9 @@ Pod::Spec.new do |s|
   s.name         = "react-native-accurate-location"
   s.version      = package["version"]
   s.summary      = package["description"]
-  s.homepage     = "https://github.com/local"
+  s.homepage     = "https://github.com/fudci/react-native-accurate-location"
   s.license      = "MIT"
-  s.authors      = { "myworkspace" => "dev@myworkspace.com" }
+  s.authors      = { "fudci" => "as.andisusilo@gmail.com" }
   s.platforms    = { :ios => "13.4" }
   s.source       = { :path => "." }
   s.source_files = "ios/**/*.{h,m,mm}"

@@ -1,4 +1,4 @@
-package com.myworkspace.accuratelocation
+package com.fudci.accuratelocation
 
 import android.Manifest
 import android.annotation.SuppressLint

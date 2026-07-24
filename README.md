@@ -1,5 +1,8 @@
 # react-native-accurate-location
 
+[![npm version](https://img.shields.io/npm/v/react-native-accurate-location.svg)](https://www.npmjs.com/package/react-native-accurate-location)
+[![license](https://img.shields.io/npm/l/react-native-accurate-location.svg)](./LICENSE)
+
 Native TurboModule to get high accuracy device location on iOS and Android.
 
 > Requires React Native **New Architecture** (TurboModules). After installing you

@@ -1,0 +1,13 @@
+# Publish only what is listed in package.json "files".
+# Keep dev/config files out of the published tarball.
+src/**/__tests__
+babel.config.js
+tsconfig.json
+tsconfig.build.json
+.gitignore
+example/
+android/build/
+android/.gradle/
+android/.cxx/
+ios/build/
+ios/Pods/

@@ -1,0 +1,14 @@
+apply plugin: 'com.android.library'
+apply plugin: 'org.jetbrains.kotlin.android'
+apply plugin: 'com.facebook.react'
+
+android {
+  compileSdk 35
+  namespace "com.myworkspace.accuratelocation"
+  defaultConfig { minSdk 24 }
+}
+
+dependencies {
+  implementation("com.facebook.react:react-android")
+  implementation("com.google.android.gms:play-services-location:21.3.0")
+}

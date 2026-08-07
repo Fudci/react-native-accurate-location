@@ -1,7 +1,7 @@
 {
   "name": "react-native-accurate-location",
-  "version": "1.1.0",
-  "description": "Native module to get high accuracy device location for React Native",
+  "version": "2.0.0",
+  "description": "Fast, tunable high-accuracy one-shot geolocation for React Native (New Architecture): resolves on an accuracy threshold, returns the best fix on timeout, always-fresh, with mock-location detection.",
   "main": "lib/commonjs/index.js",
   "module": "lib/module/index.js",
   "types": "lib/typescript/commonjs/index.d.ts",
@@ -44,7 +44,10 @@
     "location",
     "gps",
     "geolocation",
-    "turbomodule"
+    "turbomodule",
+    "new-architecture",
+    "accuracy",
+    "mock-detection"
   ],
   "repository": {
     "type": "git",

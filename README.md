@@ -3,10 +3,17 @@
 [![npm version](https://img.shields.io/npm/v/react-native-accurate-location.svg)](https://www.npmjs.com/package/react-native-accurate-location)
 [![license](https://img.shields.io/npm/l/react-native-accurate-location.svg)](./LICENSE)
 
-Native TurboModule to get high accuracy device location on iOS and Android.
+Fast, tunable high-accuracy **one-shot** geolocation for iOS and Android. It takes a
+**fresh** fix and resolves the instant that fix meets your accuracy threshold — and if
+the threshold is never reached, it returns the **best fix seen so far** instead of just
+failing. Built-in mock-location detection.
 
 > Requires React Native **New Architecture** (TurboModules). After installing you
 > must rebuild the native app — this cannot be delivered via OTA / Expo Go.
+
+> **v2.0.0 is a breaking change.** `desiredAccuracyMeters` was removed and
+> `acceptableAccuracyMeters` is now the *resolve threshold* (the request returns as
+> soon as a fresh fix is at least this accurate). See [Migration](#migrating-from-1x).
 
 ## Installation
 
@@ -51,8 +58,7 @@ npx react-native run-android
 import AccurateLocation from 'react-native-accurate-location';
 
 const location = await AccurateLocation.getCurrentLocation({
-  desiredAccuracyMeters: 5,
-  acceptableAccuracyMeters: 15,
+  acceptableAccuracyMeters: 15, // resolve as soon as a fresh fix is ≤ 15 m
   timeoutMs: 15000,
 });
 
@@ -63,16 +69,20 @@ console.log(location.latitude, location.longitude, location.accuracy);
 
 `getCurrentLocation(options?): Promise<AccurateLocationResult>`
 
-| Option | Type | Description |
-| --- | --- | --- |
-| `desiredAccuracyMeters` | `number` | Target accuracy; resolves early once reached. Default `8`. |
-| `acceptableAccuracyMeters` | `number` | Minimum acceptable accuracy on timeout. Default `15`. |
-| `timeoutMs` | `number` | Max time to wait for a fix. Default `15000`. |
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `acceptableAccuracyMeters` | `number` | `15` | The speed/accuracy knob. Resolves the moment a **fresh** fix is at least this accurate — no waiting for a tighter one. Raise it (e.g. `30`) for faster, coarser results. |
+| `timeoutMs` | `number` | `15000` | Safety timeout. If the threshold is never met, the **best fix seen so far** is returned when this elapses (only rejects if *no* fix arrived). |
+| `maxCacheAgeMs` | `number` | `0` | If `> 0`, a cached fix younger than this **and** already within `acceptableAccuracyMeters` is returned instantly. `0` = always take a fresh fix — important when moving, so you never get a stale position. |
 
-Result: `{ latitude, longitude, accuracy, altitude?, bearing?, speed?, time, provider, isMocked }`
+Result: `{ latitude, longitude, accuracy, altitude?, bearing?, speed?, time, provider, isMocked }`.
+Behavior and defaults are identical on iOS & Android.
 
-Defaults (when an option is omitted): `desiredAccuracyMeters: 8`,
-`acceptableAccuracyMeters: 15`, `timeoutMs: 15000` — identical on iOS & Android.
+> **Pick `acceptableAccuracyMeters` above what the environment can actually deliver.**
+> The real accuracy floor is set by the hardware + surroundings (e.g. an older phone
+> indoors may floor at ~35 m). Asking for a tighter value than the floor just makes the
+> request wait until timeout. No library — free or paid — can beat that floor; only
+> moving to open sky does.
 
 `cancel(): void`
 
@@ -101,7 +111,7 @@ rejects with `LOCATION_PERMISSION_DENIED`. On iOS, when the status is `notDeterm
 | --- | --- |
 | `LOCATION_PERMISSION_DENIED` | Location permission not granted. |
 | `LOCATION_SERVICES_DISABLED` | Device Location Services / GPS are turned off. |
-| `LOCATION_ACCURACY_TIMEOUT` (Android) / `LOCATION_TIMEOUT` (iOS) | Timeout reached without a fix meeting the target. |
+| `LOCATION_TIMEOUT` | Timeout elapsed and **no** fix arrived at all. If any fix arrived, the request resolves with the best one instead of rejecting. |
 | `LOCATION_CANCELLED` | Cancelled via `cancel()`. |
 | `LOCATION_REQUEST_FAILED` (Android) | Fused provider failed & hardware GPS unavailable. |
 | `LOCATION_ERROR` (iOS) | Non-transient CoreLocation error. |
@@ -111,8 +121,9 @@ rejects with `LOCATION_PERMISSION_DENIED`. On iOS, when the status is `notDeterm
 
 The module reads GPS satellites directly, so it **does not need internet/cellular signal** to be
 accurate. What is lost offline is Assisted-GPS, so the *first fix* from a cold start can be slower
-(tens of seconds). A stale location cache is intentionally ignored beyond ~10 seconds so the offline
-position does not "stick" at an old point.
+(tens of seconds). By default (`maxCacheAgeMs: 0`) a fresh fix is always taken, so the position
+never "sticks" at an old point — important while moving. On Android the fused provider and the raw
+GPS provider run in parallel, so a fix is still produced if Play Services is unavailable.
 
 > `isMocked` is only reliable on **iOS 15+** and **Android 12 (S)+**. On older versions iOS always
 > returns `false`; Android falls back to the deprecated `isFromMockProvider` API.
@@ -123,38 +134,66 @@ Compared with commonly used React Native geolocation libraries. The points below
 are a reference based on each library's general feature set and may vary between
 versions — check each library's docs before deciding.
 
-| Feature | **accurate-location** | `@react-native-community/geolocation` | `react-native-geolocation-service` | `expo-location` |
+This table is scoped to **one-shot `getCurrentLocation`** (single fix), where this
+library focuses. `expo-location` behavior below is verified against its
+[iOS source](https://github.com/expo/expo/blob/main/packages/expo-location/ios/Providers/LocationRequester.swift);
+the other columns reflect each library's general feature set and may change between
+versions — check their docs before deciding.
+
+| Feature (one-shot) | **accurate-location** | `@react-native-community/geolocation` | `react-native-geolocation-service` | `expo-location` |
 | --- | --- | --- | --- | --- |
 | Architecture | TurboModule (New Arch) | Legacy bridge | Legacy bridge | Expo module |
-| High-accuracy focus (target + timeout) | ✅ built-in | ⚠️ manual via `enableHighAccuracy` | ✅ | ⚠️ via `Accuracy` enum |
-| Auto-resolve once accuracy reached | ✅ | ❌ | ❌ | ❌ |
-| Mock location detection (`isMocked`) | ✅ | ❌ | ✅ (Android) | ⚠️ limited |
+| Resolve strategy | **Fresh, on accuracy threshold** | First fix in timeout | First fix in timeout | **First fix, no filter** |
+| Tunable accuracy threshold | ✅ `acceptableAccuracyMeters` | ❌ | ❌ | ❌ (`accuracy` is only a hint) |
+| Returns **best fix** on timeout | ✅ | ❌ (rejects) | ❌ (rejects) | ❌ |
+| Fresh-first / anti stale-cache | ✅ (default) | ⚠️ `maximumAge` may return stale | ⚠️ `maximumAge` | ⚠️ |
+| Dual provider (fused + raw GPS) | ✅ (Android) | ❌ | ⚠️ | ❌ |
+| Mock detection (`isMocked`) | ✅ | ❌ | ✅ (Android) | ⚠️ limited |
 | Requires Expo | ❌ | ❌ | ❌ | ✅ |
-| Watch / location streaming | ❌ (single fix only) | ✅ | ✅ | ✅ |
-| Background location | ❌ | ❌ | ⚠️ limited | ✅ |
+| Watch / streaming | ❌ | ✅ | ✅ | ✅ |
+| Background / geofencing | ❌ | ❌ | ⚠️ limited | ✅ |
+| Maturity (battle-tested) | ⚠️ new | ✅✅✅ | ✅✅ | ✅✅✅ |
+
+> **Note on accuracy:** "best" here means the smartest *speed/accuracy trade-off*, not
+> more accurate coordinates. The physical accuracy floor is identical across every
+> library — it is set by the device GPS chip and surroundings, not the SDK.
 
 ### Pros
 
-- **Built for high accuracy**: `desiredAccuracyMeters` +
-  `acceptableAccuracyMeters` + `timeoutMs` in a single API, resolving faster as
-  soon as the target accuracy is reached — no manual polling.
-- **TurboModule (New Architecture)**: lower overhead and type-safe via codegen,
-  without the legacy async bridge.
-- **Built-in `isMocked`** to detect fake locations — useful for check-in /
-  anti-fraud use cases.
-- **No Expo required**: works in bare React Native projects.
+- **Tunable one-shot**: resolve the instant a fresh fix meets your threshold — a knob
+  neither `expo-location` nor `@react-native-community/geolocation` expose.
+- **Best-on-timeout**: returns the best fix instead of failing when the threshold
+  isn't reached (most libraries reject).
+- **Fresh-first**: never returns a stale cached position by default — correct while moving.
+- **Dual provider on Android** (fused + raw GPS) for offline / flaky Play Services.
+- **Built-in `isMocked`** for check-in / anti-fraud.
+- **TurboModule (New Architecture)**, type-safe via codegen. No Expo required.
 
 ### Cons
 
-- **Requires New Architecture (TurboModules)** and a native rebuild — cannot be
-  delivered via OTA / Expo Go.
-- **Single fix only**: no `watchPosition` / location streaming yet.
-- **No background location support** yet.
-- Smaller ecosystem compared to more mature mainstream libraries.
+- **Requires New Architecture** and a native rebuild — no OTA / Expo Go.
+- **One-shot only**: no `watchPosition` streaming, background, or geofencing.
+- **Newer / smaller ecosystem** than the mainstream libraries — less battle-tested.
 
-Use this library when you need **one location read as accurate as possible**
-(e.g. attendance / check-in). For continuous or background tracking,
-`react-native-geolocation-service` or `expo-location` are a better fit.
+Use this when you need **one location read, fast and as accurate as the device allows**
+(e.g. attendance / check-in). For continuous or background tracking, use
+`react-native-geolocation-service`, `expo-location`, or `react-native-background-geolocation`.
+
+## Migrating from 1.x
+
+`getCurrentLocation` options changed:
+
+| 1.x | 2.0 |
+| --- | --- |
+| `desiredAccuracyMeters` | **removed** — there is no separate "ideal" target anymore |
+| `acceptableAccuracyMeters` (timeout floor) | now the **resolve threshold**: the request returns as soon as a fresh fix is at least this accurate |
+| — | `maxCacheAgeMs` (new, default `0` = always fresh) |
+| `timeoutMs` | unchanged, but on timeout it now **resolves with the best fix** rather than rejecting |
+
+```diff
+- await AccurateLocation.getCurrentLocation({ desiredAccuracyMeters: 8, acceptableAccuracyMeters: 15 });
++ await AccurateLocation.getCurrentLocation({ acceptableAccuracyMeters: 15 });
+```
 
 ## License
 

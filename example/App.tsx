@@ -15,7 +15,6 @@ import AccurateLocation, {
 } from 'react-native-accurate-location';
 
 export default function App() {
-  const [desired, setDesired] = useState('8');
   const [acceptable, setAcceptable] = useState('15');
   const [timeout, setTimeoutMs] = useState('15000');
   const [result, setResult] = useState<AccurateLocationResult | null>(null);
@@ -45,9 +44,9 @@ export default function App() {
         return;
       }
       const loc = await AccurateLocation.getCurrentLocation({
-        desiredAccuracyMeters: Number(desired),
         acceptableAccuracyMeters: Number(acceptable),
         timeoutMs: Number(timeout),
+        maxCacheAgeMs: 0, // always take a fresh fix
       });
       setResult(loc);
     } catch (e: any) {
@@ -62,7 +61,6 @@ export default function App() {
       <ScrollView contentContainerStyle={styles.content}>
         <Text style={styles.title}>Accurate Location</Text>
 
-        <Field label="desiredAccuracyMeters" value={desired} onChange={setDesired} />
         <Field
           label="acceptableAccuracyMeters"
           value={acceptable}
@@ -176,7 +174,11 @@ const styles = StyleSheet.create({
     borderTopColor: '#eee',
     paddingTop: 12,
   },
-  row: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 4 },
+  row: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 4,
+  },
   rowKey: { color: '#555' },
   rowVal: { fontWeight: '600' },
 });

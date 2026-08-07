@@ -11,32 +11,14 @@
 @property (nonatomic, copy) RCTPromiseResolveBlock resolveBlock;
 @property (nonatomic, copy) RCTPromiseRejectBlock rejectBlock;
 @property (nonatomic, assign) BOOL isFetching;
-@property (nonatomic, strong, nullable) CLLocation *bestLocation;
-@property (nonatomic, assign) double currentDesiredAccuracy;
 @property (nonatomic, assign) double currentAcceptableAccuracy;
-// Stabilization: previous sample <= acceptable + count of consecutive consistent samples.
-@property (nonatomic, strong, nullable) CLLocation *lastAcceptable;
-@property (nonatomic, assign) NSInteger stableCount;
-// Plateau: token to cancel a stale plateau timer while accuracy is still improving.
-@property (nonatomic, assign) NSInteger plateauToken;
-@property (nonatomic, assign) BOOL plateauArmed;
+@property (nonatomic, strong, nullable) CLLocation *bestLocation;
 // notDetermined: defer starting updates until the user answers the permission prompt.
 @property (nonatomic, assign) BOOL awaitingAuthToFetch;
 @property (nonatomic, assign) double pendingTimeoutMs;
 // requestPermission(): promise waiting for the authorization result.
 @property (nonatomic, copy, nullable) RCTPromiseResolveBlock permissionResolve;
 @end
-
-// Stabilization: require N consecutive consistent samples (small inter-sample distance).
-static const NSInteger kRequiredStableSamples = 2;
-static const CLLocationDistance kMaxJumpMeters = 5.0;
-// Plateau: if accuracy does not improve by >kImproveEps within kPlateauMs -> resolve best.
-static const double kPlateauMs = 2000.0;
-static const CLLocationAccuracy kImproveEps = 1.0;
-// Instant cache only if VERY fresh (< 1 second) and already accurate.
-static const NSTimeInterval kInstantCacheMaxAge = 1.0;
-// Samples older than this are ignored, so offline does not return a stale position.
-static const NSTimeInterval kMaxSampleAge = 10.0;
 
 @implementation AccurateLocation
 
@@ -53,11 +35,11 @@ RCT_EXPORT_MODULE(AccurateLocation)
 
 // ─── Core Logic ─────────────────────────────────────────────────────────────
 
-- (void)fetchLocationWithAccuracy:(double)desiredAccuracyMeters
-                       acceptable:(double)acceptableAccuracyMeters
-                          timeout:(double)timeoutMs
-                          resolve:(RCTPromiseResolveBlock)resolve
-                           reject:(RCTPromiseRejectBlock)reject {
+- (void)fetchLocationWithAcceptable:(double)acceptableAccuracyMeters
+                        maxCacheAge:(double)maxCacheAgeMs
+                            timeout:(double)timeoutMs
+                            resolve:(RCTPromiseResolveBlock)resolve
+                             reject:(RCTPromiseRejectBlock)reject {
     if (self.isFetching) {
         reject(@"LOCATION_FETCH_IN_PROGRESS", @"A location fetch is already in progress.", nil);
         return;
@@ -67,24 +49,11 @@ RCT_EXPORT_MODULE(AccurateLocation)
     self.rejectBlock = reject;
     self.isFetching = YES;
     self.bestLocation = nil;
-    self.lastAcceptable = nil;
-    self.stableCount = 0;
-    self.plateauToken = 0;
-    self.plateauArmed = NO;
     self.currentAcceptableAccuracy = acceptableAccuracyMeters;
+    // NearestTenMeters resolves noticeably faster than Best; we resolve as soon as a
+    // fix meets the acceptable threshold anyway, so this is only a hardware hint.
+    self.locationManager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters;
 
-    // Set desired accuracy level for CLLocationManager
-    if (desiredAccuracyMeters <= 5.0) {
-        self.locationManager.desiredAccuracy = kCLLocationAccuracyBestForNavigation;
-    } else if (desiredAccuracyMeters <= 10.0) {
-        self.locationManager.desiredAccuracy = kCLLocationAccuracyBest;
-    } else if (desiredAccuracyMeters <= 100.0) {
-        self.locationManager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters;
-    } else {
-        self.locationManager.desiredAccuracy = kCLLocationAccuracyHundredMeters;
-    }
-
-    // Check authorization
     CLAuthorizationStatus status;
     if (@available(iOS 14.0, *)) {
         status = self.locationManager.authorizationStatus;
@@ -98,19 +67,14 @@ RCT_EXPORT_MODULE(AccurateLocation)
         return;
     }
 
-    self.currentDesiredAccuracy = desiredAccuracyMeters;
     self.pendingTimeoutMs = timeoutMs;
 
-    // notDetermined: request permission first, continue in didChangeAuthorization. Without
-    // this, startUpdatingLocation shows no prompt and the request hangs until timeout.
     if (status == kCLAuthorizationStatusNotDetermined) {
         self.awaitingAuthToFetch = YES;
         [self.locationManager requestWhenInUseAuthorization];
         return;
     }
 
-    // Fail-fast if location services (GPS) are off. Call on a background queue
-    // to avoid the "may cause UI unresponsiveness" warning.
     __block BOOL servicesEnabled = YES;
     dispatch_sync(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
         servicesEnabled = [CLLocationManager locationServicesEnabled];
@@ -121,13 +85,13 @@ RCT_EXPORT_MODULE(AccurateLocation)
         return;
     }
 
-    // Fast path: use cache if fresh (< 1 second) and already meets target
+    // Optional instant path: only a VERY fresh cache already within the accuracy target.
+    // Off by default (maxCacheAgeMs=0) so a moving device never returns a stale position.
     CLLocation *lastLoc = self.locationManager.location;
-    if (lastLoc) {
-        NSTimeInterval age = -[lastLoc.timestamp timeIntervalSinceNow];
-        // Instant cache only if very fresh & already meets the ideal target,
-        // so a coarse/stale cache never compromises accuracy.
-        if (age < kInstantCacheMaxAge && lastLoc.horizontalAccuracy > 0 && lastLoc.horizontalAccuracy <= desiredAccuracyMeters) {
+    if (maxCacheAgeMs > 0 && lastLoc && lastLoc.horizontalAccuracy > 0 &&
+        lastLoc.horizontalAccuracy <= acceptableAccuracyMeters) {
+        NSTimeInterval ageMs = -[lastLoc.timestamp timeIntervalSinceNow] * 1000.0;
+        if (ageMs < maxCacheAgeMs) {
             [self finishWithLocation:lastLoc];
             return;
         }
@@ -142,6 +106,7 @@ RCT_EXPORT_MODULE(AccurateLocation)
     double timeoutMs = self.pendingTimeoutMs;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeoutMs * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
         if (self.isFetching) {
+            // Return the best fresh fix seen so far; only error if nothing arrived.
             if (self.bestLocation && self.bestLocation.horizontalAccuracy > 0) {
                 [self finishWithLocation:self.bestLocation];
             } else {
@@ -149,8 +114,6 @@ RCT_EXPORT_MODULE(AccurateLocation)
             }
         }
     });
-
-    // Start continuous updates (polls every update from GPS until target is met)
     [self.locationManager startUpdatingLocation];
 }
 
@@ -160,10 +123,10 @@ RCT_EXPORT_MODULE(AccurateLocation)
 RCT_EXPORT_METHOD(getCurrentLocation:(NSDictionary *)options
                   resolve:(RCTPromiseResolveBlock)resolve
                   reject:(RCTPromiseRejectBlock)reject) {
-    double desiredAccuracyMeters = options[@"desiredAccuracyMeters"] ? [options[@"desiredAccuracyMeters"] doubleValue] : 8.0;
-    double acceptableAccuracyMeters = options[@"acceptableAccuracyMeters"] ? [options[@"acceptableAccuracyMeters"] doubleValue] : 15.0;
+    double acceptable = options[@"acceptableAccuracyMeters"] ? [options[@"acceptableAccuracyMeters"] doubleValue] : 15.0;
+    double maxCacheAgeMs = options[@"maxCacheAgeMs"] ? [options[@"maxCacheAgeMs"] doubleValue] : 0.0;
     double timeoutMs = options[@"timeoutMs"] ? [options[@"timeoutMs"] doubleValue] : 15000.0;
-    [self fetchLocationWithAccuracy:desiredAccuracyMeters acceptable:acceptableAccuracyMeters timeout:timeoutMs resolve:resolve reject:reject];
+    [self fetchLocationWithAcceptable:acceptable maxCacheAge:maxCacheAgeMs timeout:timeoutMs resolve:resolve reject:reject];
 }
 
 RCT_EXPORT_METHOD(cancel) {
@@ -180,57 +143,13 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
 
 - (void)locationManager:(CLLocationManager *)manager didUpdateLocations:(NSArray<CLLocation *> *)locations {
     CLLocation *location = [locations lastObject];
-    if (!location) return;
-
-    if (location.horizontalAccuracy <= 0) return;
-
-    // Drop stale samples: CoreLocation may deliver an old cached fix as the first
-    // update. When OFFLINE this is what makes the position "stick" at an old location.
-    NSTimeInterval sampleAge = -[location.timestamp timeIntervalSinceNow];
-    if (sampleAge > kMaxSampleAge) return;
-
-    CLLocation *prevBest = self.bestLocation;
-    BOOL improved = !prevBest || location.horizontalAccuracy < prevBest.horizontalAccuracy - kImproveEps;
-    if (!prevBest || location.horizontalAccuracy < prevBest.horizontalAccuracy) {
+    if (!location || location.horizontalAccuracy <= 0) return;
+    // Track the best fresh fix; resolve the instant one meets the accuracy target.
+    if (!self.bestLocation || location.horizontalAccuracy < self.bestLocation.horizontalAccuracy) {
         self.bestLocation = location;
     }
-    CLLocation *best = self.bestLocation;
-    if (!best) return;
-
-    // Convergence (anti-jump): count consecutive samples close to each other.
     if (location.horizontalAccuracy <= self.currentAcceptableAccuracy) {
-        CLLocation *prev = self.lastAcceptable;
-        if (prev && [prev distanceFromLocation:location] <= kMaxJumpMeters) {
-            self.stableCount += 1;
-        } else {
-            self.stableCount = 1;
-        }
-        self.lastAcceptable = location;
-    }
-
-    // Not settled yet -> do not resolve (avoid jittery points).
-    if (self.stableCount < kRequiredStableSamples) return;
-
-    // Ideal target reached -> finish (use the best location).
-    if (best.horizontalAccuracy <= self.currentDesiredAccuracy) {
-        [self finishWithLocation:best];
-        return;
-    }
-
-    // Settled & good enough: keep chasing tighter accuracy, but if it does not improve
-    // within kPlateauMs -> resolve the BEST location (not the latest).
-    if (best.horizontalAccuracy <= self.currentAcceptableAccuracy) {
-        if (!self.plateauArmed || improved) {
-            self.plateauArmed = YES;
-            self.plateauToken += 1;
-            NSInteger token = self.plateauToken;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kPlateauMs * NSEC_PER_MSEC)),
-                           dispatch_get_main_queue(), ^{
-                if (self.isFetching && token == self.plateauToken) {
-                    [self finishWithLocation:self.bestLocation];
-                }
-            });
-        }
+        [self finishWithLocation:location];
     }
 }
 
@@ -368,10 +287,10 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
 - (void)getCurrentLocation:(JS::NativeAccurateLocation::AccurateLocationOptions &)options
                    resolve:(RCTPromiseResolveBlock)resolve
                     reject:(RCTPromiseRejectBlock)reject {
-    double desiredAccuracyMeters = options.desiredAccuracyMeters().has_value() ? options.desiredAccuracyMeters().value() : 8.0;
-    double acceptableAccuracyMeters = options.acceptableAccuracyMeters().has_value() ? options.acceptableAccuracyMeters().value() : 15.0;
+    double acceptable = options.acceptableAccuracyMeters().has_value() ? options.acceptableAccuracyMeters().value() : 15.0;
     double timeoutMs = options.timeoutMs().has_value() ? options.timeoutMs().value() : 15000.0;
-    [self fetchLocationWithAccuracy:desiredAccuracyMeters acceptable:acceptableAccuracyMeters timeout:timeoutMs resolve:resolve reject:reject];
+    double maxCacheAgeMs = options.maxCacheAgeMs().has_value() ? options.maxCacheAgeMs().value() : 0.0;
+    [self fetchLocationWithAcceptable:acceptable maxCacheAge:maxCacheAgeMs timeout:timeoutMs resolve:resolve reject:reject];
 }
 
 - (void)cancel {

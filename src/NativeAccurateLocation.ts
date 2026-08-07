@@ -2,9 +2,23 @@ import type { TurboModule } from 'react-native';
 import { Platform, TurboModuleRegistry } from 'react-native';
 
 export type AccurateLocationOptions = {
-  desiredAccuracyMeters?: number;
+  /**
+   * Resolve as soon as a FRESH fix is at least this accurate (meters). Default 15.
+   * This is the speed/accuracy knob: the request returns the moment a new fix meets
+   * it — no waiting for a tighter one. Raise it (e.g. 30) for faster, coarser results.
+   */
   acceptableAccuracyMeters?: number;
+  /**
+   * Safety timeout (ms). If the accuracy target is never met, the best fix seen so
+   * far is returned when this elapses. Default 15000.
+   */
   timeoutMs?: number;
+  /**
+   * If > 0, a cached fix younger than this (ms) AND already within
+   * `acceptableAccuracyMeters` is returned instantly. Default 0 (always take a fresh
+   * fix) — important when moving, so you never get a stale position.
+   */
+  maxCacheAgeMs?: number;
 };
 
 export type AccurateLocationResult = {

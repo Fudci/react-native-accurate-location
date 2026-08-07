@@ -31,28 +31,10 @@ class AccurateLocationModule(
 
     companion object {
         const val NAME = "AccurateLocation"
-        private const val DEFAULT_DESIRED_ACCURACY_METERS = 8.0
         private const val DEFAULT_ACCEPTABLE_ACCURACY_METERS = 15.0
         private const val DEFAULT_TIMEOUT_MS = 15000.0
+        private const val DEFAULT_MAX_CACHE_AGE_MS = 0.0
         private const val PERMISSION_REQUEST_CODE = 4269
-
-        // Stabilization: number of consecutive samples that must be consistent before
-        // resolving early, and the max jump (meters) between samples still considered
-        // "settled" (i.e. not jitter).
-        private const val REQUIRED_STABLE_SAMPLES = 2
-        private const val MAX_JUMP_METERS = 5.0f
-
-        // Plateau: if the best accuracy does not improve by more than IMPROVE_EPS_METERS
-        // within PLATEAU_MS, assume it has bottomed out -> resolve with the best location.
-        private const val PLATEAU_MS = 2000L
-        private const val IMPROVE_EPS_METERS = 1.0f
-
-        // Instant cache: only usable when VERY fresh (< 1 second) and already accurate.
-        private const val INSTANT_CACHE_MAX_AGE_MS = 1000L
-
-        // Max cache age allowed to seed the initial "bestLocation" (timeout fallback).
-        // Older than this -> cache is ignored so offline does not return a stale position.
-        private const val SEED_CACHE_MAX_AGE_MS = 10000L
     }
 
     private val locationManager: LocationManager? by lazy {
@@ -92,12 +74,6 @@ class AccurateLocationModule(
             return
         }
 
-        val desiredAccuracyMeters =
-            options?.takeIf { it.hasKey("desiredAccuracyMeters") }
-                ?.getDouble("desiredAccuracyMeters")
-                ?: DEFAULT_DESIRED_ACCURACY_METERS
-
-        // "Good enough" threshold. Default is looser than the ideal target for faster resolve.
         val acceptableAccuracyMeters =
             options?.takeIf { it.hasKey("acceptableAccuracyMeters") }
                 ?.getDouble("acceptableAccuracyMeters")
@@ -108,9 +84,14 @@ class AccurateLocationModule(
                 ?.getDouble("timeoutMs")
                 ?: DEFAULT_TIMEOUT_MS
 
-        requestAccurateLocation(
-            desiredAccuracyMeters = desiredAccuracyMeters.toFloat(),
+        val maxCacheAgeMs =
+            options?.takeIf { it.hasKey("maxCacheAgeMs") }
+                ?.getDouble("maxCacheAgeMs")
+                ?: DEFAULT_MAX_CACHE_AGE_MS
+
+        requestFastLocation(
             acceptableAccuracyMeters = acceptableAccuracyMeters.toFloat(),
+            maxCacheAgeMs = maxCacheAgeMs.toLong(),
             timeoutMs = timeoutMs.toLong(),
             promise = promise
         )
@@ -175,23 +156,18 @@ class AccurateLocationModule(
     }
 
     @SuppressLint("MissingPermission")
-    private fun requestAccurateLocation(
-        desiredAccuracyMeters: Float,
+    private fun requestFastLocation(
         acceptableAccuracyMeters: Float,
+        maxCacheAgeMs: Long,
         timeoutMs: Long,
         promise: Promise
     ) {
         val mainHandler = Handler(Looper.getMainLooper())
-        var bestLocation: Location? = null
         var didFinish = false
+        var bestLocation: Location? = null
         var timeoutRunnable: Runnable? = null
         var callback: LocationCallback? = null
         var gpsListener: LocationListener? = null
-
-        // Stabilization: previous sample <= acceptable + count of consecutive consistent samples.
-        var lastAcceptable: Location? = null
-        var stableCount = 0
-        var plateauRunnable: Runnable? = null
 
         fun finish(location: Location?, code: String? = null, message: String? = null) {
             if (didFinish) return
@@ -200,7 +176,6 @@ class AccurateLocationModule(
             callback?.let { fusedLocationClient.removeLocationUpdates(it) }
             gpsListener?.let { locationManager?.removeUpdates(it) }
             timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
-            plateauRunnable?.let { mainHandler.removeCallbacks(it) }
 
             if (location != null) {
                 promise.resolve(locationToMap(location))
@@ -212,63 +187,21 @@ class AccurateLocationModule(
             }
         }
 
+        // On timeout: return the best fresh fix seen so far (never a stale cache).
         timeoutRunnable = Runnable {
-            finish(
-                bestLocation,
-                "LOCATION_ACCURACY_TIMEOUT",
-                "Unable to reach desired accuracy within timeout"
-            )
+            finish(bestLocation, "LOCATION_TIMEOUT", "Location request timed out")
         }
 
-        // Register the cancellation handle; invoked by cancel() from JS.
         activeCancel = {
             finish(null, "LOCATION_CANCELLED", "Location request was cancelled")
         }
 
-        // Process a single location sample (from either fused or hardware GPS) with the
-        // same stabilization + plateau rules, then resolve once the criteria are met.
-        fun processSample(latestLocation: Location) {
-            if (didFinish) return
-            if (!latestLocation.hasAccuracy()) return
-
-            val prevBest = bestLocation
-            val improved = prevBest == null ||
-                latestLocation.accuracy < prevBest.accuracy - IMPROVE_EPS_METERS
-            if (prevBest == null || latestLocation.accuracy < prevBest.accuracy) {
-                bestLocation = latestLocation
-            }
-            val best = bestLocation ?: return
-
-            // Convergence (anti-jump): count consecutive samples close to each other.
-            if (latestLocation.accuracy <= acceptableAccuracyMeters) {
-                val prev = lastAcceptable
-                stableCount = if (prev != null && prev.distanceTo(latestLocation) <= MAX_JUMP_METERS) {
-                    stableCount + 1
-                } else {
-                    1
-                }
-                lastAcceptable = latestLocation
-            }
-
-            // Not settled yet -> do not resolve (avoid jittery points).
-            if (stableCount < REQUIRED_STABLE_SAMPLES) return
-
-            // Ideal target reached -> finish immediately (use the best location).
-            if (best.accuracy <= desiredAccuracyMeters) {
-                finish(best)
-                return
-            }
-
-            // Settled & good enough: keep chasing tighter accuracy, but if it does not
-            // improve within PLATEAU_MS -> resolve the BEST location (not the latest).
-            if (best.accuracy <= acceptableAccuracyMeters) {
-                if (plateauRunnable == null || improved) {
-                    plateauRunnable?.let { mainHandler.removeCallbacks(it) }
-                    val r = Runnable { finish(bestLocation) }
-                    plateauRunnable = r
-                    mainHandler.postDelayed(r, PLATEAU_MS)
-                }
-            }
+        // Track the best fresh sample; resolve the instant one meets the accuracy target.
+        fun onSample(location: Location) {
+            if (!location.hasAccuracy()) return
+            val prev = bestLocation
+            if (prev == null || location.accuracy < prev.accuracy) bestLocation = location
+            if (location.accuracy <= acceptableAccuracyMeters) finish(location)
         }
 
         fun startLocationUpdates() {
@@ -276,46 +209,34 @@ class AccurateLocationModule(
 
             val locationRequest = LocationRequest.Builder(
                 Priority.PRIORITY_HIGH_ACCURACY,
-                500L // Very fast polling (every 0.5s)
+                500L
             )
                 .setMinUpdateIntervalMillis(250L)
-                .setWaitForAccurateLocation(true)
                 .build()
 
             callback = object : LocationCallback() {
                 override fun onLocationResult(result: LocationResult) {
-                    val latestLocation = result.lastLocation ?: return
-                    processSample(latestLocation)
+                    result.lastLocation?.let { onSample(it) }
                 }
             }
 
-            val timeoutTask = timeoutRunnable ?: return
-            mainHandler.postDelayed(timeoutTask, timeoutMs)
+            timeoutRunnable?.let { mainHandler.postDelayed(it, timeoutMs) }
 
             fusedLocationClient.requestLocationUpdates(
                 locationRequest,
                 callback!!,
                 Looper.getMainLooper()
             ).addOnFailureListener { error ->
-                // Fused failed (e.g. Play Services issue). Don't give up immediately:
-                // hardware GPS can still run on its own. Reject only if both are unavailable.
                 if (gpsListener == null) {
-                    finish(
-                        bestLocation,
-                        "LOCATION_REQUEST_FAILED",
-                        error.message ?: "Failed to request location updates"
-                    )
+                    finish(bestLocation, "LOCATION_REQUEST_FAILED", error.message ?: "Failed to request location")
                 }
             }
 
-            // Hardware GPS fallback (pure satellite, no internet needed). Runs in parallel
-            // with fused so that OFFLINE still yields the latest fix, not a stale cache.
+            // Raw GPS fallback in parallel (works offline / if Play Services is flaky).
             val lm = locationManager
             if (lm != null && lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
                 val listener = object : LocationListener {
-                    override fun onLocationChanged(location: Location) {
-                        processSample(location)
-                    }
+                    override fun onLocationChanged(location: Location) = onSample(location)
 
                     @Deprecated("Deprecated in API 29")
                     override fun onStatusChanged(provider: String?, status: Int, extras: android.os.Bundle?) {}
@@ -324,44 +245,25 @@ class AccurateLocationModule(
                 }
                 gpsListener = listener
                 try {
-                    lm.requestLocationUpdates(
-                        LocationManager.GPS_PROVIDER,
-                        250L,
-                        0f,
-                        listener,
-                        Looper.getMainLooper()
-                    )
+                    lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 250L, 0f, listener, Looper.getMainLooper())
                 } catch (e: SecurityException) {
                     gpsListener = null
                 }
             }
         }
 
-        // Check the last known location first
+        // Optional instant path: only a VERY fresh cache that is already accurate enough.
+        // Off by default (maxCacheAgeMs=0) so a moving device never gets a stale position.
         fusedLocationClient.lastLocation.addOnCompleteListener { task ->
             if (didFinish) return@addOnCompleteListener
-            if (task.isSuccessful) {
-                val location = task.result
-                if (location != null) {
-                    val ageMs = System.currentTimeMillis() - location.time
-                    // Instant cache only if VERY fresh (< 1s) and already meets the ideal
-                    // target, so a coarse/stale cache never compromises accuracy.
-                    if (ageMs < INSTANT_CACHE_MAX_AGE_MS &&
-                        location.hasAccuracy() &&
-                        location.accuracy <= desiredAccuracyMeters
-                    ) {
-                        finish(location)
-                        return@addOnCompleteListener
-                    }
-                    // Seed "bestLocation" ONLY when the cache is still fresh enough.
-                    // A stale cache is ignored so an offline timeout does not return an
-                    // old position — let the latest satellite fix fill bestLocation.
-                    if (ageMs < SEED_CACHE_MAX_AGE_MS) {
-                        bestLocation = location
-                    }
-                }
+            val location = task.result
+            if (maxCacheAgeMs > 0 && task.isSuccessful && location != null && location.hasAccuracy() &&
+                location.accuracy <= acceptableAccuracyMeters &&
+                System.currentTimeMillis() - location.time < maxCacheAgeMs
+            ) {
+                finish(location)
+                return@addOnCompleteListener
             }
-            // If there is no location or it is not accurate enough, force a fresh recalculation.
             startLocationUpdates()
         }
     }

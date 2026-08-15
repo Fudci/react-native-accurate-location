@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.1
+
+### Fixed
+
+- **No more waiting out the full timeout when the accuracy target is unreachable.**
+  `getCurrentLocation` now resolves with the best fix as soon as accuracy stops
+  improving (~2.5s plateau), instead of blocking until `timeoutMs`. This fixes the
+  common indoor case (e.g. target 15 m but the room floors at ~35 m) that previously
+  looked like a constant timeout even on capable phones.
+
 ## 2.0.0
 
 ### Breaking

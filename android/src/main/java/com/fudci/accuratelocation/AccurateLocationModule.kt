@@ -35,6 +35,11 @@ class AccurateLocationModule(
         private const val DEFAULT_TIMEOUT_MS = 15000.0
         private const val DEFAULT_MAX_CACHE_AGE_MS = 0.0
         private const val PERMISSION_REQUEST_CODE = 4269
+
+        // If accuracy does not improve by more than IMPROVE_EPS_METERS within PLATEAU_MS,
+        // assume it has bottomed out and resolve with the best fix so far.
+        private const val PLATEAU_MS = 2500L
+        private const val IMPROVE_EPS_METERS = 1.0f
     }
 
     private val locationManager: LocationManager? by lazy {
@@ -166,6 +171,7 @@ class AccurateLocationModule(
         var didFinish = false
         var bestLocation: Location? = null
         var timeoutRunnable: Runnable? = null
+        var plateauRunnable: Runnable? = null
         var callback: LocationCallback? = null
         var gpsListener: LocationListener? = null
 
@@ -176,6 +182,7 @@ class AccurateLocationModule(
             callback?.let { fusedLocationClient.removeLocationUpdates(it) }
             gpsListener?.let { locationManager?.removeUpdates(it) }
             timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+            plateauRunnable?.let { mainHandler.removeCallbacks(it) }
 
             if (location != null) {
                 promise.resolve(locationToMap(location))
@@ -196,12 +203,27 @@ class AccurateLocationModule(
             finish(null, "LOCATION_CANCELLED", "Location request was cancelled")
         }
 
-        // Track the best fresh sample; resolve the instant one meets the accuracy target.
+        // Resolve the instant a fresh fix meets the target. Otherwise, once accuracy
+        // stops improving for PLATEAU_MS, settle for the best fix so far — this keeps it
+        // fast indoors, where the target may be physically unreachable (would otherwise
+        // wait out the whole timeout).
         fun onSample(location: Location) {
             if (!location.hasAccuracy()) return
             val prev = bestLocation
+            val improved = prev == null || location.accuracy < prev.accuracy - IMPROVE_EPS_METERS
             if (prev == null || location.accuracy < prev.accuracy) bestLocation = location
-            if (location.accuracy <= acceptableAccuracyMeters) finish(location)
+
+            val best = bestLocation ?: return
+            if (best.accuracy <= acceptableAccuracyMeters) {
+                finish(best)
+                return
+            }
+            if (improved || plateauRunnable == null) {
+                plateauRunnable?.let { mainHandler.removeCallbacks(it) }
+                val r = Runnable { finish(bestLocation) }
+                plateauRunnable = r
+                mainHandler.postDelayed(r, PLATEAU_MS)
+            }
         }
 
         fun startLocationUpdates() {

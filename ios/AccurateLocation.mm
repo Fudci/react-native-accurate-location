@@ -13,12 +13,19 @@
 @property (nonatomic, assign) BOOL isFetching;
 @property (nonatomic, assign) double currentAcceptableAccuracy;
 @property (nonatomic, strong, nullable) CLLocation *bestLocation;
+// Plateau: token to cancel a stale plateau timer while accuracy is still improving.
+@property (nonatomic, assign) NSInteger plateauToken;
+@property (nonatomic, assign) BOOL plateauArmed;
 // notDetermined: defer starting updates until the user answers the permission prompt.
 @property (nonatomic, assign) BOOL awaitingAuthToFetch;
 @property (nonatomic, assign) double pendingTimeoutMs;
 // requestPermission(): promise waiting for the authorization result.
 @property (nonatomic, copy, nullable) RCTPromiseResolveBlock permissionResolve;
 @end
+
+// If accuracy does not improve by >kImproveEps within kPlateauMs, resolve the best fix.
+static const double kPlateauMs = 2500.0;
+static const CLLocationAccuracy kImproveEps = 1.0;
 
 @implementation AccurateLocation
 
@@ -49,6 +56,8 @@ RCT_EXPORT_MODULE(AccurateLocation)
     self.rejectBlock = reject;
     self.isFetching = YES;
     self.bestLocation = nil;
+    self.plateauToken = 0;
+    self.plateauArmed = NO;
     self.currentAcceptableAccuracy = acceptableAccuracyMeters;
     // NearestTenMeters resolves noticeably faster than Best; we resolve as soon as a
     // fix meets the acceptable threshold anyway, so this is only a hardware hint.
@@ -144,12 +153,31 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
 - (void)locationManager:(CLLocationManager *)manager didUpdateLocations:(NSArray<CLLocation *> *)locations {
     CLLocation *location = [locations lastObject];
     if (!location || location.horizontalAccuracy <= 0) return;
-    // Track the best fresh fix; resolve the instant one meets the accuracy target.
-    if (!self.bestLocation || location.horizontalAccuracy < self.bestLocation.horizontalAccuracy) {
+
+    CLLocation *prev = self.bestLocation;
+    BOOL improved = !prev || location.horizontalAccuracy < prev.horizontalAccuracy - kImproveEps;
+    if (!prev || location.horizontalAccuracy < prev.horizontalAccuracy) {
         self.bestLocation = location;
     }
-    if (location.horizontalAccuracy <= self.currentAcceptableAccuracy) {
-        [self finishWithLocation:location];
+    CLLocation *best = self.bestLocation;
+
+    // Target reached -> resolve now.
+    if (best.horizontalAccuracy <= self.currentAcceptableAccuracy) {
+        [self finishWithLocation:best];
+        return;
+    }
+    // Otherwise, once accuracy stops improving for kPlateauMs, settle for the best fix
+    // — keeps it fast indoors where the target may be physically unreachable.
+    if (improved || !self.plateauArmed) {
+        self.plateauArmed = YES;
+        self.plateauToken += 1;
+        NSInteger token = self.plateauToken;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kPlateauMs * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self.isFetching && token == self.plateauToken) {
+                [self finishWithLocation:self.bestLocation];
+            }
+        });
     }
 }
 

@@ -46,7 +46,7 @@ export default function App() {
       const loc = await AccurateLocation.getCurrentLocation({
         acceptableAccuracyMeters: Number(acceptable),
         timeoutMs: Number(timeout),
-        maxCacheAgeMs: 0, // always take a fresh fix
+        maxCacheAgeMs: 3, // always take a fresh fix
       });
       setResult(loc);
     } catch (e: any) {

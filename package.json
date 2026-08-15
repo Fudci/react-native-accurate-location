@@ -1,6 +1,6 @@
 {
   "name": "react-native-accurate-location",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Fast, tunable high-accuracy one-shot geolocation for React Native (New Architecture): resolves on an accuracy threshold, returns the best fix on timeout, always-fresh, with mock-location detection.",
   "main": "lib/commonjs/index.js",
   "module": "lib/module/index.js",

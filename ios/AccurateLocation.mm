@@ -245,7 +245,10 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
 - (void)finishWithLocation:(CLLocation *)location {
     if (!self.isFetching) return;
     self.isFetching = NO;
-    if (!self.warmupActive) [self.locationManager stopUpdatingLocation];
+    // The read is done, so warmup has served its purpose -> stop it (saves battery).
+    self.warmupActive = NO;
+    self.warmupToken += 1;
+    [self.locationManager stopUpdatingLocation];
     self.bestLocation = nil;
 
     if (self.resolveBlock) {
@@ -276,7 +279,10 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
     if (!self.isFetching) return;
     self.isFetching = NO;
     self.awaitingAuthToFetch = NO;
-    if (!self.warmupActive) [self.locationManager stopUpdatingLocation];
+    // The read is done, so warmup has served its purpose -> stop it (saves battery).
+    self.warmupActive = NO;
+    self.warmupToken += 1;
+    [self.locationManager stopUpdatingLocation];
     self.bestLocation = nil;
 
     if (self.rejectBlock) {

@@ -10,6 +10,7 @@ import {
   TextInput,
   TouchableOpacity,
   View,
+  StatusBar,
 } from 'react-native';
 import { WebView } from 'react-native-webview';
 import AccurateLocation, {
@@ -84,6 +85,7 @@ export default function App() {
 
   return (
     <SafeAreaView style={styles.container}>
+      <StatusBar backgroundColor={'red'} barStyle={'dark-content'} />
       <ScrollView contentContainerStyle={styles.content}>
         <Text style={styles.title}>Accurate Location</Text>
 
@@ -191,13 +193,14 @@ const styles = StyleSheet.create({
   content: { padding: 20 },
   title: { fontSize: 22, fontWeight: '700', marginBottom: 16 },
   field: { marginBottom: 12 },
-  label: { fontSize: 13, color: '#555', marginBottom: 4 },
+  label: { fontSize: 13, color: '#111', marginBottom: 4 },
   input: {
     borderWidth: 1,
     borderColor: '#ccc',
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 8,
+    color: '#000',
   },
   button: {
     backgroundColor: '#2563eb',
@@ -243,6 +246,6 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     paddingVertical: 4,
   },
-  rowKey: { color: '#555' },
-  rowVal: { fontWeight: '600' },
+  rowKey: { color: '#000' },
+  rowVal: { color: '#000', fontWeight: '700' },
 });

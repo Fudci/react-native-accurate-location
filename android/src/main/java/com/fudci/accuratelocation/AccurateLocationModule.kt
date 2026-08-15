@@ -220,6 +220,8 @@ class AccurateLocationModule(
             gpsListener?.let { locationManager?.removeUpdates(it) }
             timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
             plateauRunnable?.let { mainHandler.removeCallbacks(it) }
+            // The read is done, so warmup has served its purpose -> stop it (saves battery).
+            stopWarmupInternal()
 
             if (location != null) {
                 promise.resolve(locationToMap(location))

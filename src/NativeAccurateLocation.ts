@@ -44,7 +44,9 @@ export interface Spec extends TurboModule {
   /**
    * Pre-warm the GPS so the next `getCurrentLocation` resolves fast (avoids the cold-start
    * delay). Call it when you know a location read is coming soon — e.g. when the screen
-   * opens. Runs for `durationMs` (default 30000) then stops itself. Safe to call repeatedly.
+   * opens. It stops automatically as soon as a `getCurrentLocation` finishes (success or
+   * timeout), or after `durationMs` (default 30000) if no read happens — whichever comes
+   * first, so the GPS is never left running longer than needed. Safe to call repeatedly.
    */
   warmup(durationMs?: number): void;
   /** Stop a warmup started with `warmup()`. Safe to call when not warming up. */

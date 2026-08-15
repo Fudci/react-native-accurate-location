@@ -6,7 +6,9 @@
 
 - **`warmup(durationMs?)` / `stopWarmup()`** — pre-warm the GPS (e.g. when a screen
   opens) so the *first* `getCurrentLocation` resolves fast instead of paying the GPS
-  cold-start delay. Runs for `durationMs` (default 30000) then stops itself.
+  cold-start delay. It **stops automatically once a `getCurrentLocation` finishes**
+  (success or timeout), or after `durationMs` (default 30000) if no read happens —
+  whichever is first, so the GPS is never left on longer than needed.
 
 ## 2.0.1
 

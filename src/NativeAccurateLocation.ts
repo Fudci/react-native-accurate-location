@@ -41,6 +41,14 @@ export interface Spec extends TurboModule {
   ): Promise<AccurateLocationResult>;
   /** Cancel the in-flight location request. Safe to call when no request is active. */
   cancel(): void;
+  /**
+   * Pre-warm the GPS so the next `getCurrentLocation` resolves fast (avoids the cold-start
+   * delay). Call it when you know a location read is coming soon — e.g. when the screen
+   * opens. Runs for `durationMs` (default 30000) then stops itself. Safe to call repeatedly.
+   */
+  warmup(durationMs?: number): void;
+  /** Stop a warmup started with `warmup()`. Safe to call when not warming up. */
+  stopWarmup(): void;
   /** Request location permission from the system. Resolves with the final status. */
   requestPermission(): Promise<PermissionStatus>;
 }
@@ -54,6 +62,8 @@ const fallback = {
     );
   },
   cancel: () => {},
+  warmup: () => {},
+  stopWarmup: () => {},
   requestPermission: async (): Promise<PermissionStatus> => 'unavailable',
   addListener: () => {},
   removeListeners: () => {},

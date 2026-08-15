@@ -19,6 +19,9 @@
 // notDetermined: defer starting updates until the user answers the permission prompt.
 @property (nonatomic, assign) BOOL awaitingAuthToFetch;
 @property (nonatomic, assign) double pendingTimeoutMs;
+// Warmup: keeps CoreLocation running so the next fetch resolves fast.
+@property (nonatomic, assign) BOOL warmupActive;
+@property (nonatomic, assign) NSInteger warmupToken;
 // requestPermission(): promise waiting for the authorization result.
 @property (nonatomic, copy, nullable) RCTPromiseResolveBlock permissionResolve;
 @end
@@ -142,6 +145,14 @@ RCT_EXPORT_METHOD(cancel) {
     [self doCancel];
 }
 
+RCT_EXPORT_METHOD(warmup:(double)durationMs) {
+    [self doWarmup:durationMs];
+}
+
+RCT_EXPORT_METHOD(stopWarmup) {
+    [self doStopWarmup];
+}
+
 RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
                   reject:(RCTPromiseRejectBlock)reject) {
     [self doRequestPermission:resolve reject:reject];
@@ -234,7 +245,7 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
 - (void)finishWithLocation:(CLLocation *)location {
     if (!self.isFetching) return;
     self.isFetching = NO;
-    [self.locationManager stopUpdatingLocation];
+    if (!self.warmupActive) [self.locationManager stopUpdatingLocation];
     self.bestLocation = nil;
 
     if (self.resolveBlock) {
@@ -265,7 +276,7 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
     if (!self.isFetching) return;
     self.isFetching = NO;
     self.awaitingAuthToFetch = NO;
-    [self.locationManager stopUpdatingLocation];
+    if (!self.warmupActive) [self.locationManager stopUpdatingLocation];
     self.bestLocation = nil;
 
     if (self.rejectBlock) {
@@ -281,6 +292,32 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
     if (self.isFetching) {
         [self finishWithError:@"LOCATION_CANCELLED" message:@"Location request was cancelled"];
     }
+}
+
+- (void)doWarmup:(double)durationMs {
+    CLAuthorizationStatus status;
+    if (@available(iOS 14.0, *)) {
+        status = self.locationManager.authorizationStatus;
+    } else {
+        status = [CLLocationManager authorizationStatus];
+    }
+    if (status == kCLAuthorizationStatusDenied || status == kCLAuthorizationStatusRestricted) return;
+    self.warmupActive = YES;
+    self.locationManager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters;
+    [self.locationManager startUpdatingLocation];
+    self.warmupToken += 1;
+    NSInteger token = self.warmupToken;
+    double dur = durationMs > 0 ? durationMs : 30000.0;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(dur * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        if (token == self.warmupToken) [self doStopWarmup];
+    });
+}
+
+- (void)doStopWarmup {
+    self.warmupActive = NO;
+    self.warmupToken += 1;
+    if (!self.isFetching) [self.locationManager stopUpdatingLocation];
 }
 
 - (void)doRequestPermission:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject {
@@ -323,6 +360,14 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
 
 - (void)cancel {
     [self doCancel];
+}
+
+- (void)warmup:(NSNumber *)durationMs {
+    [self doWarmup:durationMs ? [durationMs doubleValue] : 0.0];
+}
+
+- (void)stopWarmup {
+    [self doStopWarmup];
 }
 
 - (void)requestPermission:(RCTPromiseResolveBlock)resolve

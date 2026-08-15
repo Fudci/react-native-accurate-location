@@ -53,6 +53,11 @@ class AccurateLocationModule(
     // Handle to cancel the active location request from outside (invoked by cancel()).
     private var activeCancel: (() -> Unit)? = null
 
+    // Warmup: keeps the GPS active so the next getCurrentLocation resolves fast.
+    private val warmupHandler = Handler(Looper.getMainLooper())
+    private var warmupCallback: LocationCallback? = null
+    private var warmupStop: Runnable? = null
+
     // Permission promise waiting for the requestPermissions result.
     private var pendingPermissionPromise: Promise? = null
 
@@ -104,6 +109,38 @@ class AccurateLocationModule(
 
     override fun cancel() {
         activeCancel?.invoke()
+    }
+
+    @SuppressLint("MissingPermission")
+    override fun warmup(durationMs: Double?) {
+        if (!hasFineLocationPermission() || !isLocationEnabled()) return
+        stopWarmupInternal()
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000L)
+            .setMinUpdateIntervalMillis(500L)
+            .build()
+        val cb = object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) { /* keep GPS warm */ }
+        }
+        warmupCallback = cb
+        try {
+            fusedLocationClient.requestLocationUpdates(request, cb, Looper.getMainLooper())
+        } catch (e: SecurityException) {
+            warmupCallback = null
+            return
+        }
+        val dur = if (durationMs != null && durationMs > 0) durationMs.toLong() else 30000L
+        val r = Runnable { stopWarmupInternal() }
+        warmupStop = r
+        warmupHandler.postDelayed(r, dur)
+    }
+
+    override fun stopWarmup() = stopWarmupInternal()
+
+    private fun stopWarmupInternal() {
+        warmupStop?.let { warmupHandler.removeCallbacks(it) }
+        warmupStop = null
+        warmupCallback?.let { fusedLocationClient.removeLocationUpdates(it) }
+        warmupCallback = null
     }
 
     override fun requestPermission(promise: Promise) {

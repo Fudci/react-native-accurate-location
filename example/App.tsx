@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
+  Linking,
   Platform,
   PermissionsAndroid,
   SafeAreaView,
@@ -10,9 +11,27 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import { WebView } from 'react-native-webview';
 import AccurateLocation, {
   type AccurateLocationResult,
 } from 'react-native-accurate-location';
+
+// Leaflet map (OpenStreetMap tiles — no API key) with a marker + accuracy circle.
+function mapHtml(lat: number, lng: number, accuracy: number): string {
+  return `<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>html,body,#map{height:100%;margin:0}</style>
+</head><body><div id="map"></div><script>
+  var m = L.map('map').setView([${lat}, ${lng}], 17);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap'
+  }).addTo(m);
+  L.marker([${lat}, ${lng}]).addTo(m).bindPopup('You are here (±${accuracy} m)').openPopup();
+  L.circle([${lat}, ${lng}], { radius: ${accuracy}, color: '#2563eb' }).addTo(m);
+</script></body></html>`;
+}
 
 export default function App() {
   const [acceptable, setAcceptable] = useState('15');
@@ -20,6 +39,13 @@ export default function App() {
   const [result, setResult] = useState<AccurateLocationResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  // Pre-warm the GPS as soon as the screen opens so the first Get Location is fast.
+  // (Takes effect once location permission is granted.)
+  useEffect(() => {
+    AccurateLocation.warmup(30000);
+    return () => AccurateLocation.stopWarmup();
+  }, []);
 
   const ensurePermission = async (): Promise<boolean> => {
     if (Platform.OS === 'android') {
@@ -46,7 +72,7 @@ export default function App() {
       const loc = await AccurateLocation.getCurrentLocation({
         acceptableAccuracyMeters: Number(acceptable),
         timeoutMs: Number(timeout),
-        maxCacheAgeMs: 3, // always take a fresh fix
+        maxCacheAgeMs: 0, // always take a fresh fix
       });
       setResult(loc);
     } catch (e: any) {
@@ -90,17 +116,39 @@ export default function App() {
         {error && <Text style={styles.error}>{error}</Text>}
 
         {result && (
-          <View style={styles.result}>
-            <Row k="latitude" v={result.latitude} />
-            <Row k="longitude" v={result.longitude} />
-            <Row k="accuracy (m)" v={result.accuracy} />
-            <Row k="altitude" v={result.altitude ?? '-'} />
-            <Row k="bearing" v={result.bearing ?? '-'} />
-            <Row k="speed" v={result.speed ?? '-'} />
-            <Row k="provider" v={result.provider} />
-            <Row k="isMocked" v={String(result.isMocked)} />
-            <Row k="time" v={new Date(result.time).toISOString()} />
-          </View>
+          <>
+            <View style={styles.mapBox}>
+              <WebView
+                source={{
+                  html: mapHtml(
+                    result.latitude,
+                    result.longitude,
+                    result.accuracy,
+                  ),
+                }}
+                style={styles.map}
+              />
+            </View>
+            <TouchableOpacity
+              style={styles.maps}
+              onPress={() =>
+                Linking.openURL(
+                  `https://www.google.com/maps/search/?api=1&query=${result.latitude},${result.longitude}`,
+                )
+              }
+            >
+              <Text style={styles.buttonText}>Open in Google Maps</Text>
+            </TouchableOpacity>
+
+            <View style={styles.result}>
+              <Row k="accuracy (m)" v={result.accuracy} />
+              <Row k="latitude" v={result.latitude} />
+              <Row k="longitude" v={result.longitude} />
+              <Row k="provider" v={result.provider} />
+              <Row k="isMocked" v={String(result.isMocked)} />
+              <Row k="time" v={new Date(result.time).toLocaleTimeString()} />
+            </View>
+          </>
         )}
       </ScrollView>
     </SafeAreaView>
@@ -166,8 +214,24 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginTop: 8,
   },
+  maps: {
+    backgroundColor: '#059669',
+    borderRadius: 8,
+    paddingVertical: 12,
+    alignItems: 'center',
+    marginTop: 8,
+  },
   buttonText: { color: '#fff', fontWeight: '600' },
   error: { color: '#dc2626', marginTop: 16 },
+  mapBox: {
+    height: 300,
+    marginTop: 20,
+    borderRadius: 12,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#eee',
+  },
+  map: { flex: 1 },
   result: {
     marginTop: 20,
     borderTopWidth: 1,

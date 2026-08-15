@@ -89,6 +89,22 @@ Behavior and defaults are identical on iOS & Android.
 Cancels the in-flight `getCurrentLocation` request. The pending promise rejects with code
 `LOCATION_CANCELLED`. Safe to call even when no request is active.
 
+`warmup(durationMs?: number): void` / `stopWarmup(): void`
+
+Pre-warms the GPS so the **first** `getCurrentLocation` resolves fast, avoiding the
+cold-start delay. Call `warmup()` when you know a read is coming soon (e.g. when the
+screen opens); it keeps the GPS active for `durationMs` (default `30000`) then stops
+itself. Requires location permission to have any effect. Example:
+
+```ts
+useEffect(() => {
+  AccurateLocation.warmup(30000);      // start warming on screen open
+  return () => AccurateLocation.stopWarmup();
+}, []);
+// ...later, the user taps a button:
+const loc = await AccurateLocation.getCurrentLocation({ acceptableAccuracyMeters: 15 });
+```
+
 `requestPermission(): Promise<PermissionStatus>`
 
 Requests location permission from the system. `PermissionStatus` = `'granted' | 'denied' | 'blocked' | 'unavailable'`.

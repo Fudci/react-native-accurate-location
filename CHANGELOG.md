@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.1.0
+
+### Added
+
+- **`warmup(durationMs?)` / `stopWarmup()`** — pre-warm the GPS (e.g. when a screen
+  opens) so the *first* `getCurrentLocation` resolves fast instead of paying the GPS
+  cold-start delay. Runs for `durationMs` (default 30000) then stops itself.
+
 ## 2.0.1
 
 ### Fixed

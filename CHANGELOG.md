@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.3.0
+
+Same code as 2.2.0, which was tagged but never published to npm. Use this version;
+2.2.0 does not exist on the registry.
+
 ## 2.2.0
 
 ### Added

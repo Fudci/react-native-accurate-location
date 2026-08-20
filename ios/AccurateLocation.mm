@@ -19,6 +19,18 @@
 // notDetermined: defer starting updates until the user answers the permission prompt.
 @property (nonatomic, assign) BOOL awaitingAuthToFetch;
 @property (nonatomic, assign) double pendingTimeoutMs;
+// Per-request tuning, mirroring the Android module.
+@property (nonatomic, assign) double currentMaxFixAgeMs;
+@property (nonatomic, assign) double currentMinSettleMs;
+@property (nonatomic, assign) BOOL smoothingEnabled;
+@property (nonatomic, assign) BOOL adaptiveTimeoutEnabled;
+@property (nonatomic, assign) BOOL allowStaleFallbackEnabled;
+// Monotonic start of the request, so a system clock change cannot skew the settle window.
+@property (nonatomic, assign) NSTimeInterval startUptime;
+// Token so the timeout can be re-armed (cold-start extension) without the old one firing.
+@property (nonatomic, assign) NSInteger timeoutToken;
+// Recent accepted fixes, oldest first, used to median away multipath scatter.
+@property (nonatomic, strong) NSMutableArray<CLLocation *> *recentLocations;
 // Warmup: keeps CoreLocation running so the next fetch resolves fast.
 @property (nonatomic, assign) BOOL warmupActive;
 @property (nonatomic, assign) NSInteger warmupToken;
@@ -27,8 +39,31 @@
 @end
 
 // If accuracy does not improve by >kImproveEps within kPlateauMs, resolve the best fix.
-static const double kPlateauMs = 2500.0;
-static const CLLocationAccuracy kImproveEps = 1.0;
+static const double kPlateauMs = 6000.0;
+static const CLLocationAccuracy kImproveEps = 0.3;
+
+// A fix reports the accuracy it had WHEN IT WAS TAKEN, so an old one keeps claiming a tight
+// accuracy for a place the device has already left — precise, but wrong. Older ones are refused.
+static const double kDefaultMaxFixAgeMs = 3000.0;
+
+// GNSS converges over time and its earliest fixes are its worst, so returning immediately is
+// what makes a one-shot read lose to a maps app that has simply been listening for longer.
+static const double kDefaultMinSettleMs = 4000.0;
+static const CLLocationAccuracy kExcellentAccuracy = 5.0;
+
+// Without a network assist the almanac has to come from the satellites themselves and the first
+// fix can take far longer than the default deadline allows. If nothing has arrived by the probe
+// mark, the deadline is stretched rather than giving up on a chip that was nearly ready.
+static const double kColdStartProbeMs = 10000.0;
+static const double kColdStartTimeoutMs = 45000.0;
+
+// Multipath scatters fixes around the true position rather than dragging them off it, so the
+// median of recent samples lands closer than any single one.
+static const NSUInteger kSmoothingWindow = 8;
+static const double kSmoothingAccuracySlack = 1.5;
+
+// A jump implying a speed no phone-carrying person reaches is a bad fix, not movement.
+static const double kMaxPlausibleSpeedMps = 50.0;
 
 @implementation AccurateLocation
 
@@ -47,6 +82,11 @@ RCT_EXPORT_MODULE(AccurateLocation)
 
 - (void)fetchLocationWithAcceptable:(double)acceptableAccuracyMeters
                         maxCacheAge:(double)maxCacheAgeMs
+                          maxFixAge:(double)maxFixAgeMs
+                          minSettle:(double)minSettleMs
+                          smoothing:(BOOL)smoothing
+                    adaptiveTimeout:(BOOL)adaptiveTimeout
+                 allowStaleFallback:(BOOL)allowStaleFallback
                             timeout:(double)timeoutMs
                             resolve:(RCTPromiseResolveBlock)resolve
                              reject:(RCTPromiseRejectBlock)reject {
@@ -62,9 +102,18 @@ RCT_EXPORT_MODULE(AccurateLocation)
     self.plateauToken = 0;
     self.plateauArmed = NO;
     self.currentAcceptableAccuracy = acceptableAccuracyMeters;
-    // NearestTenMeters resolves noticeably faster than Best; we resolve as soon as a
-    // fix meets the acceptable threshold anyway, so this is only a hardware hint.
-    self.locationManager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters;
+    self.currentMaxFixAgeMs = maxFixAgeMs;
+    self.currentMinSettleMs = minSettleMs;
+    self.smoothingEnabled = smoothing;
+    self.adaptiveTimeoutEnabled = adaptiveTimeout;
+    self.allowStaleFallbackEnabled = allowStaleFallback;
+    self.recentLocations = [NSMutableArray array];
+    self.startUptime = NSProcessInfo.processInfo.systemUptime;
+    // Asking for ten metres caps the hardware below a tighter target, so the request could never
+    // be satisfied and would always fall through to the plateau. Match the ask instead.
+    self.locationManager.desiredAccuracy = acceptableAccuracyMeters < 10.0
+        ? kCLLocationAccuracyBest
+        : kCLLocationAccuracyNearestTenMeters;
 
     CLAuthorizationStatus status;
     if (@available(iOS 14.0, *)) {
@@ -115,18 +164,71 @@ RCT_EXPORT_MODULE(AccurateLocation)
 // Arm the timeout + start continuous updates. Extracted so it can be re-invoked from
 // didChangeAuthorization after the user answers the permission prompt (notDetermined case).
 - (void)beginLocationUpdates {
-    double timeoutMs = self.pendingTimeoutMs;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeoutMs * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-        if (self.isFetching) {
-            // Return the best fresh fix seen so far; only error if nothing arrived.
-            if (self.bestLocation && self.bestLocation.horizontalAccuracy > 0) {
-                [self finishWithLocation:self.bestLocation];
-            } else {
-                [self finishWithError:@"LOCATION_TIMEOUT" message:@"Location request timed out"];
+    [self armTimeout:self.pendingTimeoutMs];
+
+    // Cold start with no assistance data: stretch the deadline instead of giving up on a chip
+    // that simply has not decoded the almanac yet. Only ever extends, never shortens.
+    if (self.adaptiveTimeoutEnabled && self.pendingTimeoutMs < kColdStartTimeoutMs) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kColdStartProbeMs * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self.isFetching && self.bestLocation == nil) {
+                double remaining = kColdStartTimeoutMs - [self elapsedMs];
+                if (remaining > 0) [self armTimeout:remaining];
             }
+        });
+    }
+
+    // The settle window may close after the target was already met, so re-check then.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(self.currentMinSettleMs * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        if (self.isFetching && self.bestLocation &&
+            self.bestLocation.horizontalAccuracy > 0 &&
+            self.bestLocation.horizontalAccuracy <= self.currentAcceptableAccuracy) {
+            [self finishWithLocation:self.bestLocation];
         }
     });
+
     [self.locationManager startUpdatingLocation];
+}
+
+- (double)elapsedMs {
+    return (NSProcessInfo.processInfo.systemUptime - self.startUptime) * 1000.0;
+}
+
+// Age of a fix in ms. CoreLocation only exposes a wall-clock timestamp, so unlike Android this
+// cannot be read from the monotonic clock.
+- (double)ageMsOf:(CLLocation *)location {
+    return -[location.timestamp timeIntervalSinceNow] * 1000.0;
+}
+
+- (void)armTimeout:(double)ms {
+    self.timeoutToken += 1;
+    NSInteger token = self.timeoutToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        if (self.isFetching && token == self.timeoutToken) [self timedOut];
+    });
+}
+
+// The deadline passed. Return the best fresh fix; failing that, fall back to the last known
+// position at any age rather than failing outright — a worse answer beats no answer, and
+// `ageMs` on the result says how old it is.
+- (void)timedOut {
+    if (self.bestLocation && self.bestLocation.horizontalAccuracy > 0) {
+        [self finishWithLocation:self.bestLocation];
+        return;
+    }
+    CLLocation *cached = self.allowStaleFallbackEnabled ? self.locationManager.location : nil;
+    if (cached && cached.horizontalAccuracy > 0) {
+        // Deliberately unfiltered: no age limit, no accuracy gate, no smoothing.
+        [self.recentLocations removeAllObjects];
+        [self finishWithLocation:cached];
+    } else if (self.allowStaleFallbackEnabled) {
+        [self finishWithError:@"LOCATION_TIMEOUT"
+                      message:@"Location request timed out and no last known position is available"];
+    } else {
+        [self finishWithError:@"LOCATION_TIMEOUT" message:@"Location request timed out"];
+    }
 }
 
 // ─── RCT_EXPORT_METHOD (Old Arch bridge fallback) ────────────────────────────
@@ -137,8 +239,24 @@ RCT_EXPORT_METHOD(getCurrentLocation:(NSDictionary *)options
                   reject:(RCTPromiseRejectBlock)reject) {
     double acceptable = options[@"acceptableAccuracyMeters"] ? [options[@"acceptableAccuracyMeters"] doubleValue] : 15.0;
     double maxCacheAgeMs = options[@"maxCacheAgeMs"] ? [options[@"maxCacheAgeMs"] doubleValue] : 0.0;
-    double timeoutMs = options[@"timeoutMs"] ? [options[@"timeoutMs"] doubleValue] : 15000.0;
-    [self fetchLocationWithAcceptable:acceptable maxCacheAge:maxCacheAgeMs timeout:timeoutMs resolve:resolve reject:reject];
+    BOOL explicitTimeout = options[@"timeoutMs"] != nil;
+    double timeoutMs = explicitTimeout ? [options[@"timeoutMs"] doubleValue] : 15000.0;
+    double maxFixAgeMs = options[@"maxFixAgeMs"] ? [options[@"maxFixAgeMs"] doubleValue] : kDefaultMaxFixAgeMs;
+    double minSettleMs = options[@"minSettleMs"] ? [options[@"minSettleMs"] doubleValue] : kDefaultMinSettleMs;
+    BOOL smoothing = options[@"smoothing"] ? [options[@"smoothing"] boolValue] : YES;
+    // A timeout the caller wrote down is a promise, so it is never stretched behind their back.
+    BOOL adaptiveTimeout = options[@"adaptiveTimeout"] ? [options[@"adaptiveTimeout"] boolValue] : !explicitTimeout;
+    BOOL allowStaleFallback = options[@"allowStaleFallback"] ? [options[@"allowStaleFallback"] boolValue] : YES;
+    [self fetchLocationWithAcceptable:acceptable
+                          maxCacheAge:maxCacheAgeMs
+                            maxFixAge:maxFixAgeMs
+                            minSettle:minSettleMs
+                            smoothing:smoothing
+                      adaptiveTimeout:adaptiveTimeout
+                   allowStaleFallback:allowStaleFallback
+                              timeout:timeoutMs
+                              resolve:resolve
+                               reject:reject];
 }
 
 RCT_EXPORT_METHOD(cancel) {
@@ -165,6 +283,26 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
     CLLocation *location = [locations lastObject];
     if (!location || location.horizontalAccuracy <= 0) return;
 
+    // Refuse stale fixes. CoreLocation hands over its cached location as an early update, which
+    // would otherwise resolve the request with a position the device has already left.
+    if (self.currentMaxFixAgeMs > 0 && [self ageMsOf:location] > self.currentMaxFixAgeMs) return;
+
+    // Refuse physically impossible jumps — a multipath outlier, not movement.
+    CLLocation *previousAccepted = self.recentLocations.lastObject;
+    if (previousAccepted) {
+        NSTimeInterval seconds =
+            [location.timestamp timeIntervalSinceDate:previousAccepted.timestamp];
+        if (seconds > 0 &&
+            [location distanceFromLocation:previousAccepted] / seconds > kMaxPlausibleSpeedMps) {
+            return;
+        }
+    }
+
+    [self.recentLocations addObject:location];
+    while (self.recentLocations.count > kSmoothingWindow) {
+        [self.recentLocations removeObjectAtIndex:0];
+    }
+
     CLLocation *prev = self.bestLocation;
     BOOL improved = !prev || location.horizontalAccuracy < prev.horizontalAccuracy - kImproveEps;
     if (!prev || location.horizontalAccuracy < prev.horizontalAccuracy) {
@@ -172,8 +310,11 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
     }
     CLLocation *best = self.bestLocation;
 
-    // Target reached -> resolve now.
-    if (best.horizontalAccuracy <= self.currentAcceptableAccuracy) {
+    // Target reached, but only stop early once the receiver has had time to converge — or if the
+    // fix is already so tight that waiting cannot meaningfully improve it.
+    if (best.horizontalAccuracy <= self.currentAcceptableAccuracy &&
+        ([self elapsedMs] >= self.currentMinSettleMs ||
+         best.horizontalAccuracy <= kExcellentAccuracy)) {
         [self finishWithLocation:best];
         return;
     }
@@ -185,7 +326,18 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
         NSInteger token = self.plateauToken;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kPlateauMs * NSEC_PER_MSEC)),
                        dispatch_get_main_queue(), ^{
-            if (self.isFetching && token == self.plateauToken) {
+            if (!self.isFetching || token != self.plateauToken) return;
+            // Accuracy has bottomed out, but honour the settle window so a plateau hit in the
+            // first seconds does not cut the read short.
+            double remaining = self.currentMinSettleMs - [self elapsedMs];
+            if (remaining > 0) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(remaining * NSEC_PER_MSEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (self.isFetching && token == self.plateauToken) {
+                        [self finishWithLocation:self.bestLocation];
+                    }
+                });
+            } else {
                 [self finishWithLocation:self.bestLocation];
             }
         });
@@ -242,14 +394,53 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-- (void)finishWithLocation:(CLLocation *)location {
+static double MedianOfSorted(NSArray<NSNumber *> *values) {
+    NSArray<NSNumber *> *sorted = [values sortedArrayUsingSelector:@selector(compare:)];
+    NSUInteger mid = sorted.count / 2;
+    if (sorted.count % 2 == 0) {
+        return (sorted[mid - 1].doubleValue + sorted[mid].doubleValue) / 2.0;
+    }
+    return sorted[mid].doubleValue;
+}
+
+// Replaces the coordinates with the median of the comparable samples around them. Multipath
+// scatters fixes around the true position, so the median sits closer to it than any one sample.
+// The accuracy and timestamp of `best` are kept as-is.
+- (CLLocation *)smoothed:(CLLocation *)best {
+    if (!self.smoothingEnabled) return best;
+    NSMutableArray<NSNumber *> *lats = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *lons = [NSMutableArray array];
+    for (CLLocation *loc in self.recentLocations) {
+        if (loc.horizontalAccuracy > 0 &&
+            loc.horizontalAccuracy <= best.horizontalAccuracy * kSmoothingAccuracySlack) {
+            [lats addObject:@(loc.coordinate.latitude)];
+            [lons addObject:@(loc.coordinate.longitude)];
+        }
+    }
+    if (lats.count < 3) return best;
+    CLLocationCoordinate2D coord =
+        CLLocationCoordinate2DMake(MedianOfSorted(lats), MedianOfSorted(lons));
+    return [[CLLocation alloc] initWithCoordinate:coord
+                                         altitude:best.altitude
+                               horizontalAccuracy:best.horizontalAccuracy
+                                 verticalAccuracy:best.verticalAccuracy
+                                           course:best.course
+                                            speed:best.speed
+                                        timestamp:best.timestamp];
+}
+
+- (void)finishWithLocation:(CLLocation *)rawLocation {
     if (!self.isFetching) return;
+    // Age is read before smoothing, since smoothing rebuilds the object.
+    double ageMs = [self ageMsOf:rawLocation];
+    CLLocation *location = [self smoothed:rawLocation];
     self.isFetching = NO;
     // The read is done, so warmup has served its purpose -> stop it (saves battery).
     self.warmupActive = NO;
     self.warmupToken += 1;
     [self.locationManager stopUpdatingLocation];
     self.bestLocation = nil;
+    [self.recentLocations removeAllObjects];
 
     if (self.resolveBlock) {
         NSMutableDictionary *result = [NSMutableDictionary dictionary];
@@ -258,6 +449,9 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
         result[@"accuracy"]  = @(location.horizontalAccuracy);
         result[@"altitude"]  = @(location.altitude);
         result[@"time"]      = @([location.timestamp timeIntervalSince1970] * 1000.0);
+        // How old the fix is. A large value means this is the stale last-known fallback rather
+        // than a live reading, and the caller can decide whether that is good enough.
+        result[@"ageMs"]     = @(ageMs);
         result[@"provider"]  = @"core-location";
 
         if (location.course >= 0) result[@"bearing"] = @(location.course);
@@ -284,6 +478,7 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
     self.warmupToken += 1;
     [self.locationManager stopUpdatingLocation];
     self.bestLocation = nil;
+    [self.recentLocations removeAllObjects];
 
     if (self.rejectBlock) {
         self.rejectBlock(code, message, nil);
@@ -359,9 +554,29 @@ RCT_EXPORT_METHOD(requestPermission:(RCTPromiseResolveBlock)resolve
                    resolve:(RCTPromiseResolveBlock)resolve
                     reject:(RCTPromiseRejectBlock)reject {
     double acceptable = options.acceptableAccuracyMeters().has_value() ? options.acceptableAccuracyMeters().value() : 15.0;
-    double timeoutMs = options.timeoutMs().has_value() ? options.timeoutMs().value() : 15000.0;
+    BOOL explicitTimeout = options.timeoutMs().has_value();
+    double timeoutMs = explicitTimeout ? options.timeoutMs().value() : 15000.0;
     double maxCacheAgeMs = options.maxCacheAgeMs().has_value() ? options.maxCacheAgeMs().value() : 0.0;
-    [self fetchLocationWithAcceptable:acceptable maxCacheAge:maxCacheAgeMs timeout:timeoutMs resolve:resolve reject:reject];
+    double maxFixAgeMs = options.maxFixAgeMs().has_value() ? options.maxFixAgeMs().value() : kDefaultMaxFixAgeMs;
+    double minSettleMs = options.minSettleMs().has_value() ? options.minSettleMs().value() : kDefaultMinSettleMs;
+    BOOL smoothing = options.smoothing().has_value() ? options.smoothing().value() : YES;
+    // A timeout the caller wrote down is a promise, so it is never stretched behind their back.
+    BOOL adaptiveTimeout = options.adaptiveTimeout().has_value()
+        ? options.adaptiveTimeout().value()
+        : !explicitTimeout;
+    BOOL allowStaleFallback = options.allowStaleFallback().has_value()
+        ? options.allowStaleFallback().value()
+        : YES;
+    [self fetchLocationWithAcceptable:acceptable
+                          maxCacheAge:maxCacheAgeMs
+                            maxFixAge:maxFixAgeMs
+                            minSettle:minSettleMs
+                            smoothing:smoothing
+                      adaptiveTimeout:adaptiveTimeout
+                   allowStaleFallback:allowStaleFallback
+                              timeout:timeoutMs
+                              resolve:resolve
+                               reject:reject];
 }
 
 - (void)cancel {

@@ -74,8 +74,16 @@ console.log(location.latitude, location.longitude, location.accuracy);
 | `acceptableAccuracyMeters` | `number` | `15` | The speed/accuracy knob. Resolves the moment a **fresh** fix is at least this accurate — no waiting for a tighter one. Raise it (e.g. `30`) for faster, coarser results. |
 | `timeoutMs` | `number` | `15000` | Safety timeout. If the threshold is never met, the **best fix seen so far** is returned when this elapses (only rejects if *no* fix arrived). |
 | `maxCacheAgeMs` | `number` | `0` | If `> 0`, a cached fix younger than this **and** already within `acceptableAccuracyMeters` is returned instantly. `0` = always take a fresh fix — important when moving, so you never get a stale position. |
+| `maxFixAgeMs` | `number` | `3000` | Reject any fix older than this. A fix carries the accuracy it had *when it was taken*, so an old one keeps claiming a tight accuracy for a place the device has already left — the usual cause of a position that is precise yet tens of metres wrong. `0` = accept any age. |
+| `minSettleMs` | `number` | `4000` | Don't resolve before this has elapsed, unless the fix is already better than 5 m. GNSS converges over time and its earliest fixes are its worst. Lower for speed, raise for accuracy. |
+| `smoothing` | `boolean` | `true` | Return the median of recent comparable fixes instead of a single sample. Multipath scatters fixes *around* the true position, so the median lands closer than any individual fix. |
+| `adaptiveTimeout` | `boolean` | `true`\* | Extend the timeout to 45 s when no fix at all has arrived after 10 s (cold start without A-GPS can take 30–60 s). Only ever extends, never shortens. \*Defaults to `true` **only** when `timeoutMs` is left at its default — an explicit `timeoutMs` is honoured exactly unless you also pass `adaptiveTimeout: true`. |
+| `allowStaleFallback` | `boolean` | `true` | When the deadline passes with no fresh fix at all, resolve with the last known position at any age instead of rejecting. Check `ageMs` on the result to detect it. Set to `false` when a wrong position is worse than an error (geofencing, attendance). |
 
-Result: `{ latitude, longitude, accuracy, altitude?, bearing?, speed?, time, provider, isMocked }`.
+Result: `{ latitude, longitude, accuracy, altitude?, bearing?, speed?, time, ageMs?, provider, isMocked }`.
+
+`ageMs` is the age of the fix when it was returned — normally a few hundred ms. A large
+value means it came from the `allowStaleFallback` path.
 Behavior and defaults are identical on iOS & Android.
 
 > **Pick `acceptableAccuracyMeters` above what the environment can actually deliver.**
@@ -127,7 +135,7 @@ rejects with `LOCATION_PERMISSION_DENIED`. On iOS, when the status is `notDeterm
 | --- | --- |
 | `LOCATION_PERMISSION_DENIED` | Location permission not granted. |
 | `LOCATION_SERVICES_DISABLED` | Device Location Services / GPS are turned off. |
-| `LOCATION_TIMEOUT` | Timeout elapsed and **no** fix arrived at all. If any fix arrived, the request resolves with the best one instead of rejecting. |
+| `LOCATION_TIMEOUT` | Timeout elapsed and **no** fix arrived at all *and* no last known position was usable (or `allowStaleFallback: false`). If any fix arrived, the request resolves with the best one instead of rejecting. |
 | `LOCATION_CANCELLED` | Cancelled via `cancel()`. |
 | `LOCATION_REQUEST_FAILED` (Android) | Fused provider failed & hardware GPS unavailable. |
 | `LOCATION_ERROR` (iOS) | Non-transient CoreLocation error. |
@@ -137,9 +145,13 @@ rejects with `LOCATION_PERMISSION_DENIED`. On iOS, when the status is `notDeterm
 
 The module reads GPS satellites directly, so it **does not need internet/cellular signal** to be
 accurate. What is lost offline is Assisted-GPS, so the *first fix* from a cold start can be slower
-(tens of seconds). By default (`maxCacheAgeMs: 0`) a fresh fix is always taken, so the position
-never "sticks" at an old point — important while moving. On Android the fused provider and the raw
-GPS provider run in parallel, so a fix is still produced if Play Services is unavailable.
+(30–60 s) — the ephemeris has to be decoded from the satellites themselves. `adaptiveTimeout`
+covers that case by stretching the deadline to 45 s when nothing has arrived after 10 s, and
+`allowStaleFallback` keeps a fully offline cold device from failing outright by returning the last
+known position rather than an error. By default (`maxCacheAgeMs: 0`) a fresh fix is always taken,
+so the position never "sticks" at an old point — important while moving. On Android the fused
+provider and the raw GPS provider run in parallel, so a fix is still produced if Play Services is
+unavailable.
 
 > `isMocked` is only reliable on **iOS 15+** and **Android 12 (S)+**. On older versions iOS always
 > returns `false`; Android falls back to the deprecated `isFromMockProvider` API.

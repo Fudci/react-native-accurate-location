@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.2.0
+
+### Added
+
+All new options are opt-out; existing calls keep working.
+
+- **`maxFixAgeMs`** (default `3000`) — reject fixes older than this. A fix reports the
+  accuracy it had *when it was taken*, so an old one keeps claiming a tight accuracy for
+  a place the device has already left. This is the usual cause of a position that looks
+  precise (±2 m) yet sits tens of metres away.
+- **`minSettleMs`** (default `4000`) — don't resolve before this elapses unless the fix
+  is already better than 5 m. GNSS converges over time and its earliest fixes are its
+  worst.
+- **`smoothing`** (default `true`) — return the median of recent comparable fixes
+  instead of a single sample. Multipath scatters fixes *around* the true position, so
+  the median lands closer than any individual fix.
+- **`adaptiveTimeout`** — extend the deadline to 45 s when no fix at all has arrived
+  after 10 s. Defaults to `true` only when `timeoutMs` is left at its default, so an
+  explicit `timeoutMs` is never stretched behind your back.
+- **`allowStaleFallback`** (default `true`) — when the deadline passes with no fresh fix,
+  resolve with the last known position instead of rejecting. Keeps a fully offline cold
+  device from failing outright.
+- **`ageMs`** on the result — age of the fix when returned. A large value means it came
+  from the `allowStaleFallback` path.
+
 ## 2.1.0
 
 ### Added
